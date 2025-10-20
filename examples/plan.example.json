@@ -1,0 +1,5 @@
+[
+  {"type": "loss", "pct": 0.10, "params": {}},
+  {"type": "seq_offset", "pct": 0.02, "params": {"offset": 500}},
+  {"type": "length_forge", "pct": 0.01, "params": {"new_len": 512}}
+]

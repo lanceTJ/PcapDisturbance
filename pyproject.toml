@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pcaplab"
+version = "0.1.0"
+description = "High-performance PCAP perturbation toolkit"
+authors = [{name="Lance"}]
+requires-python = ">=3.9"
+dependencies = [
+  "scapy>=2.5.0",
+  "tqdm>=4.66.0",
+]
+
+[project.scripts]
+pcaplab = "pcaplab.cli:main"

@@ -1,0 +1,10 @@
+in_root: /data/en-cic2018/pcapdata
+out_root: /data/output_perturbed
+backend: threads    # or processes
+workers: 4
+chunk_size: 5000
+seed: 42
+plan:
+  - {type: loss, pct: 0.1, params: {}}
+  - {type: seq_offset, pct: 0.02, params: {offset: 500}}
+  - {type: length_forge, pct: 0.01, params: {new_len: 512}}
