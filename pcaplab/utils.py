@@ -1,7 +1,7 @@
+from __future__ import annotations
 from pathlib import Path
 import logging, json, os, re
 from datetime import datetime
-from __future__ import annotations
 import atexit
 import logging
 import os

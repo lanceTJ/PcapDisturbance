@@ -2,7 +2,7 @@
 import json, argparse
 from pathlib import Path
 from .batch import run_threads, run_processes
-from .utils import setup_logger
+from .utils import log
 
 def parse_plan_from_args(args) -> list:
     plan = []
@@ -43,7 +43,6 @@ def main():
     p.add_argument("--plan", help="JSON plan (overrides quick flags)")
 
     args = p.parse_args()
-    log = setup_logger(level=20)
 
     plan = parse_plan_from_args(args)
     in_root = Path(args.in_root).resolve()
