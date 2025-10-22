@@ -5,7 +5,7 @@ import multiprocessing as mp
 from typing import List, Dict, Any, Tuple
 import time
 from .pipeline import apply_perturbations_stream
-from .utils import ensure_dir, is_encrypted_dir, log, atomic_write_json, now_iso
+from .utils import ensure_dir, is_encrypted_dir, log, now_iso
 
 def collect_pcaps(in_root: Path) -> list[Path]:
     """收集所有以 'cap' 开头的文件（不依赖后缀名）。"""
@@ -60,6 +60,7 @@ def process_single_pcap(in_pcap: Path, in_root: Path, out_root: Path,
     )
     dur = time.time() - t0
     meta = {
+        "pcap_file": in_pcap.name,
         "input": str(in_pcap),
         "output": str(out_pcap),
         "date_dir": date_dir,
@@ -70,7 +71,7 @@ def process_single_pcap(in_pcap: Path, in_root: Path, out_root: Path,
         "elapsed_sec": round(dur, 3),
         "stats": res,
     }
-    atomic_write_json(meta_path, meta)
+    log.debug(f"Metadata for {in_pcap.name}: {meta}")
     return meta
 
 def _task(args):
