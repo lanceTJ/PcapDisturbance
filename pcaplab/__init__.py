@@ -4,5 +4,6 @@ __all__ = [
     "perturbations",
     "pipeline",
     "batch",
+    "io",
     "cli",
 ]
