@@ -5,6 +5,7 @@ class PcapSinkBuffered:
     """
     Fast buffered PCAP writer (classic pcap, little-endian).
     write_raw(ts_sec, ts_usec, pkt_bytes) appends a packet without parsing.
+    write_raw_record(rec) appends a full per-packet record (header + pkt_bytes).
     """
     def __init__(self, out_path: str, linktype: int = 1, buf_bytes: int = 8 * 1024 * 1024):
         # linktype=1 => LINKTYPE_ETHERNET; adjust if needed
@@ -31,6 +32,13 @@ class PcapSinkBuffered:
             int(cap).to_bytes(4, "little")
         )
         self._buf += pkt_bytes
+        if len(self._buf) >= self._limit:
+            self._f.write(self._buf)
+            self._buf.clear()
+
+    def write_raw_record(self, rec: bytes):
+        """Append full per-packet record directly to buffer."""
+        self._buf += rec
         if len(self._buf) >= self._limit:
             self._f.write(self._buf)
             self._buf.clear()
