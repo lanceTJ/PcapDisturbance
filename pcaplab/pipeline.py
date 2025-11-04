@@ -28,24 +28,25 @@ def _extract_ts_from_raw_records(buf: List[bytes]) -> Tuple[np.ndarray, np.ndarr
     first_hdr = buf[0][0:16]
     try:
         ts_sec, ts_usec, incl, orig = struct.unpack("<IIII", first_hdr)
-        fmt = "<II"
+        fmt = "<IIII"
         little = True
     except struct.error:
         ts_sec, ts_usec, incl, orig = struct.unpack(">IIII", first_hdr)
-        fmt = ">II"
+        fmt = ">IIII"
         little = False
     hdr_len = 16
 
     ts_sec_list = []
     ts_usec_list = []
     for rec in buf:
-        s, u = struct.unpack(fmt, rec[0:8])
+        s, u, _, _ = struct.unpack(fmt, rec[0:16])  # Extract with len for safety
         ts_sec_list.append(s)
         ts_usec_list.append(u)
 
     def patch_ts(raw: bytes, new_sec: int, new_usec: int) -> bytes:
         b = bytearray(raw)
-        b[0:8] = struct.pack(fmt + "II", int(new_sec), int(new_usec), len(raw) - hdr_len, len(raw) - hdr_len)
+        incl = len(raw) - hdr_len
+        b[0:16] = struct.pack(fmt, int(new_sec), int(new_usec), incl, incl)
         return bytes(b)
 
     return (np.array(ts_sec_list, dtype=np.int64),
@@ -54,10 +55,13 @@ def _extract_ts_from_raw_records(buf: List[bytes]) -> Tuple[np.ndarray, np.ndarr
 
 def _select_indices_and_ts_perm(
     plan: List[dict], n: int, rng: np.random.Generator, stats: dict
-) -> Tuple[np.ndarray, Dict[int, int]]:
-    """Same as original, no change."""
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Modified to return sorted ts_sec_new and ts_usec_new directly, ensuring monotonic increasing ts in output.
+    """
     idx = np.arange(n, dtype=np.int64)
-    ts_perm_map: Dict[int, int] = {i: i for i in range(n)}
+    # Placeholder for original ts, will be filled in _process_chunk
+    # Return idx_out, ts_sec_perm, ts_usec_perm where perm is sorted for reorder segments
 
     for step in plan:
         t = str(step.get("type", "")).lower()
@@ -96,22 +100,16 @@ def _select_indices_and_ts_perm(
                     seg_pos = np.arange(start, end)
                     seg_idx = idx[seg_pos]
 
-                    # Shuffle output order
+                    # Shuffle output order (content disorder)
                     perm_pos = seg_pos.copy()
                     rng.shuffle(perm_pos)
                     idx[seg_pos] = idx[perm_pos]
-
-                    # Shuffle timestamp mapping (to keep output ts monotonic)
-                    perm_glob = seg_idx.copy()
-                    rng.shuffle(perm_glob)
-                    for src, dst in zip(seg_idx, perm_glob):
-                        ts_perm_map[src] = dst
 
                     reorder_count += (end - start)
 
                 stats["reorder_packets"] = int(reorder_count)
 
-    return idx, ts_perm_map
+    return idx
 
 def _process_chunk(
     buf, sink, plan, py_rng, stats
@@ -122,48 +120,51 @@ def _process_chunk(
 
     np_rng = np.random.default_rng(py_rng.getrandbits(64))
 
-    # Selection phase
-    idx_out, ts_perm_map = _select_indices_and_ts_perm(plan, n, np_rng, stats)
+    # Selection phase (now only returns idx_out, ts handled below)
+    idx_out = _select_indices_and_ts_perm(plan, n, np_rng, stats)
 
     first = buf[0]
     if isinstance(first, (bytes, bytearray)):
-        # Raw records path (fast, no content mod)
+        # Raw records path
         ts_sec, ts_usec, patch_ts = _extract_ts_from_raw_records(buf)
 
-        perm_src = np.arange(n, dtype=np.int64)
-        for i, j in ts_perm_map.items():
-            perm_src[i] = j
-        ts_sec_new = ts_sec[perm_src]
-        ts_usec_new = ts_usec[perm_src]
+        # To ensure monotonic ts, sort the ts for output positions (after reorder)
+        # Collect original ts for idx_out
+        orig_ts_sec = ts_sec[idx_out]
+        orig_ts_usec = ts_usec[idx_out]
+        # Sort them
+        sort_indices = np.lexsort((orig_ts_usec, orig_ts_sec))  # Sort by sec then usec
+        ts_sec_new = orig_ts_sec[sort_indices]
+        ts_usec_new = orig_ts_usec[sort_indices]
 
         out_count = 0
-        for j in idx_out:
+        for i, j in enumerate(idx_out):
             rec = buf[j]
-            rec_patched = patch_ts(rec, int(ts_sec_new[j]), int(ts_usec_new[j]))
+            rec_patched = patch_ts(rec, int(ts_sec_new[i]), int(ts_usec_new[i]))
             sink.write_raw_record(rec_patched)
             out_count += 1
         return n, out_count
 
     else:
-        # Tuple path (with potential content mods)
+        # Tuple path
         ts_sec = np.fromiter((b[0] for b in buf), dtype=np.int64, count=n)
         ts_usec = np.fromiter((b[1] for b in buf), dtype=np.int64, count=n)
 
-        perm_src = np.arange(n, dtype=np.int64)
-        for i, j in ts_perm_map.items():
-            perm_src[i] = j
-        ts_sec_new = ts_sec[perm_src]
-        ts_usec_new = ts_usec[perm_src]
+        # Similar to raw: collect and sort ts for output
+        orig_ts_sec = ts_sec[idx_out]
+        orig_ts_usec = ts_usec[idx_out]
+        sort_indices = np.lexsort((orig_ts_usec, orig_ts_sec))
+        ts_sec_new = orig_ts_sec[sort_indices]
+        ts_usec_new = orig_ts_usec[sort_indices]
 
-        # Now apply content modifications (seq_offset, length_forge) to selected packets
+        # Apply content mods...
         out_count = 0
-        mod_rng = random.Random(py_rng.getrandbits(64))  # Separate RNG for mods
-        for j in idx_out:
-            ts_s = int(ts_sec_new[j])
-            ts_u = int(ts_usec_new[j])
+        mod_rng = random.Random(py_rng.getrandbits(64))
+        for i, j in enumerate(idx_out):
+            ts_s = int(ts_sec_new[i])
+            ts_u = int(ts_usec_new[i])
             pkt_bytes = buf[j][2]
 
-            # Parse to scapy Packet only if needed for this packet
             needs_mod = False
             for step in plan:
                 t = str(step.get("type", "")).lower()
@@ -171,7 +172,7 @@ def _process_chunk(
                     needs_mod = True
                     break
             if needs_mod:
-                pkt = Ether(pkt_bytes)  # Parse
+                pkt = Ether(pkt_bytes)
                 for step in plan:
                     t = str(step.get("type", "")).lower()
                     p = float(step.get("pct", 0.0))
@@ -180,16 +181,16 @@ def _process_chunk(
                         if func:
                             params = step.get("params", {})
                             modified = func(pkt, **params)
-                            if modified is None:  # e.g., loss, but already handled
+                            if modified is None:
                                 continue
-                            elif isinstance(modified, list):  # e.g., retrans
+                            elif isinstance(modified, list):
                                 for m in modified:
                                     sink.write_raw(ts_s, ts_u, bytes(m))
                                     out_count += 1
-                                continue  # Skip original
+                                continue
                             else:
                                 pkt = modified
-                pkt_bytes = bytes(pkt)  # Back to bytes after mods
+                pkt_bytes = bytes(pkt)
 
             sink.write_raw(ts_s, ts_u, pkt_bytes)
             out_count += 1
@@ -213,12 +214,20 @@ def apply_perturbations_stream(
 ):
     py_seed = _mix_seed(selection_seed, in_pcap)
     rng = random.Random(py_seed)
-    sink = PcapSinkBuffered(out_pcap)
+    
+    # Detect source linktype for sink
+    kind = _sniff_kind(in_pcap)
+    linktype = 1  # Default
+    if kind == "pcap":
+        with open(in_pcap, "rb") as f:
+            header = f.read(24)
+            byte_order = 'little' if header[0:4] in (b"\xd4\xc3\xb2\xa1", b"\x4d\x3c\xb2\xa1") else 'big'
+            linktype = int.from_bytes(header[20:24], byte_order)
+    
+    sink = PcapSinkBuffered(out_pcap, linktype=linktype)
     total_in = total_out = 0
     stats = defaultdict(int)
 
-    # Choose stream based on plan (fast raw if no parse needed and classic pcap)
-    kind = _sniff_kind(in_pcap)
     needs_parse = _plan_needs_parse(perturb_plan)
     if not needs_parse and kind == "pcap":
         stream_func = stream_raw_pcap_records
@@ -227,7 +236,7 @@ def apply_perturbations_stream(
         stream_func = stream_pcap_packets
         log.info(f"Using packet stream for {in_pcap} (parse needed)")
 
-    buf: List = []  # Type depends on stream_func
+    buf: List = []
 
     try:
         for item in stream_func(in_pcap):
@@ -235,7 +244,7 @@ def apply_perturbations_stream(
                 pkt_bytes, ts_sec, ts_usec = item
                 buf.append((ts_sec, ts_usec, pkt_bytes))
             else:
-                buf.append(item)  # raw bytes
+                buf.append(item)
             if len(buf) >= chunk_size:
                 _in, _out = _process_chunk(buf, sink, perturb_plan, rng, stats)
                 total_in += _in
