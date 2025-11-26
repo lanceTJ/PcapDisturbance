@@ -165,16 +165,16 @@ def _process_chunk(
             ts_u = int(ts_usec_new[i])
             pkt_bytes = buf[j][2]
 
-            needs_mod = False
-            for step in plan:
-                t = str(step.get("type", "")).lower()
-                if t in NEED_PARSE_OPS:
-                    needs_mod = True
-                    break
+            # Calculate needs_mod once per packet (same for all as it's plan-dependent)
+            needs_mod = any(str(s.get("type", "")).lower() in NEED_PARSE_OPS for s in plan)
             if needs_mod:
                 pkt = Ether(pkt_bytes)
+                modified_flag = False  # Track if any modification happened
                 for step in plan:
                     t = str(step.get("type", "")).lower()
+                    # Skip if not a content-level perturbation (avoid double-applying index-level ones)
+                    if t not in NEED_PARSE_OPS:
+                        continue
                     p = float(step.get("pct", 0.0))
                     if mod_rng.random() < p:
                         func = PERTURBATIONS.get(t)
@@ -182,18 +182,35 @@ def _process_chunk(
                             params = step.get("params", {})
                             modified = func(pkt, **params)
                             if modified is None:
-                                continue
+                                modified_flag = True
+                                break  # Skip writing this packet entirely
                             elif isinstance(modified, list):
                                 for m in modified:
                                     sink.write_raw(ts_s, ts_u, bytes(m))
                                     out_count += 1
-                                continue
+                                modified_flag = True
+                                break  # Skip original after writing list
                             else:
                                 pkt = modified
-                pkt_bytes = bytes(pkt)
-
-            sink.write_raw(ts_s, ts_u, pkt_bytes)
-            out_count += 1
+                                modified_flag = True
+                    if t == "seq_offset":
+                        new_bytes = bytes(pkt)
+                        if len(new_bytes) != len(pkt_bytes):
+                            log.warning(f"Seq offset changed packet length from {len(pkt_bytes)} to {len(new_bytes)}, reverting to original")
+                            pkt_bytes = pkt_bytes  # Revert to avoid loss
+                        else:
+                            pkt_bytes = new_bytes
+                        out_count += 1
+                if not modified_flag or (modified is not None and not isinstance(modified, list)):
+                    # Only write if not skipped by None or list
+                    pkt_bytes = bytes(pkt)
+                    sink.write_raw(ts_s, ts_u, pkt_bytes)
+                    out_count += 1
+                continue  # Note: this continue is not needed, but if you want to skip something
+            else:
+                # No mod needed, direct write
+                sink.write_raw(ts_s, ts_u, pkt_bytes)
+                out_count += 1
         return n, out_count
 
 def _mix_seed(selection_seed: int, in_pcap: str) -> int:
