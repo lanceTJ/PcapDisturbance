@@ -114,104 +114,150 @@ def _select_indices_and_ts_perm(
 def _process_chunk(
     buf, sink, plan, py_rng, stats
 ):
+    """
+    Process a chunk of packets, applying perturbations and writing to sink.
+    Fixed timestamp handling to preserve relative intervals without global sorting.
+    Refactored content modification loop to avoid duplicates and incorrect skips.
+    """
     n = len(buf)
     if n == 0:
         return 0, 0
 
     np_rng = np.random.default_rng(py_rng.getrandbits(64))
 
-    # Selection phase (now only returns idx_out, ts handled below)
+    # Selection phase: get perturbed indices
     idx_out = _select_indices_and_ts_perm(plan, n, np_rng, stats)
 
+    # Determine if we need parsing for content mods
+    needs_mod = _plan_needs_parse(plan)
+
     first = buf[0]
-    if isinstance(first, (bytes, bytearray)):
-        # Raw records path
+    is_raw = isinstance(first, (bytes, bytearray))
+
+    # Extract timestamps
+    if is_raw:
         ts_sec, ts_usec, patch_ts = _extract_ts_from_raw_records(buf)
-
-        # To ensure monotonic ts, sort the ts for output positions (after reorder)
-        # Collect original ts for idx_out
-        orig_ts_sec = ts_sec[idx_out]
-        orig_ts_usec = ts_usec[idx_out]
-        # Sort them
-        sort_indices = np.lexsort((orig_ts_usec, orig_ts_sec))  # Sort by sec then usec
-        ts_sec_new = orig_ts_sec[sort_indices]
-        ts_usec_new = orig_ts_usec[sort_indices]
-
-        out_count = 0
-        for i, j in enumerate(idx_out):
-            rec = buf[j]
-            rec_patched = patch_ts(rec, int(ts_sec_new[i]), int(ts_usec_new[i]))
-            sink.write_raw_record(rec_patched)
-            out_count += 1
-        return n, out_count
-
     else:
-        # Tuple path
         ts_sec = np.fromiter((b[0] for b in buf), dtype=np.int64, count=n)
         ts_usec = np.fromiter((b[1] for b in buf), dtype=np.int64, count=n)
 
-        # Similar to raw: collect and sort ts for output
-        orig_ts_sec = ts_sec[idx_out]
-        orig_ts_usec = ts_usec[idx_out]
-        sort_indices = np.lexsort((orig_ts_usec, orig_ts_sec))
-        ts_sec_new = orig_ts_sec[sort_indices]
-        ts_usec_new = orig_ts_usec[sort_indices]
+    # Get original ts for selected indices
+    orig_ts_sec = ts_sec[idx_out]
+    orig_ts_usec = ts_usec[idx_out]
 
-        # Apply content mods...
-        out_count = 0
-        mod_rng = random.Random(py_rng.getrandbits(64))
-        for i, j in enumerate(idx_out):
-            ts_s = int(ts_sec_new[i])
-            ts_u = int(ts_usec_new[i])
+    # Fix: Compute new ts by shifting relative to the first selected packet's ts
+    # This preserves relative deltas, ensures monotonicity in output order
+    if len(idx_out) > 0:
+        base_sec = orig_ts_sec[0]
+        base_usec = orig_ts_usec[0]
+        # Compute deltas and apply cumulatively to ensure increasing order
+        prev_sec, prev_usec = base_sec, base_usec
+        ts_sec_new = np.zeros_like(orig_ts_sec)
+        ts_usec_new = np.zeros_like(orig_ts_usec)
+        ts_sec_new[0] = base_sec
+        ts_usec_new[0] = base_usec
+        for i in range(1, len(idx_out)):
+            delta_sec = orig_ts_sec[i] - orig_ts_sec[i-1]
+            delta_usec = orig_ts_usec[i] - orig_ts_usec[i-1]
+            new_sec = prev_sec + delta_sec
+            new_usec = prev_usec + delta_usec
+            if new_usec < 0:
+                new_usec += 1_000_000
+                new_sec -= 1
+            elif new_usec >= 1_000_000:
+                new_sec += new_usec // 1_000_000
+                new_usec %= 1_000_000
+            # Ensure non-decreasing (add epsilon if needed)
+            if new_sec < prev_sec or (new_sec == prev_sec and new_usec <= prev_usec):
+                new_sec = prev_sec
+                new_usec = prev_usec + 1  # Minimal increment
+            ts_sec_new[i] = new_sec
+            ts_usec_new[i] = new_usec
+            prev_sec, prev_usec = new_sec, new_usec
+    else:
+        return n, 0  # No outputs
+
+    out_count = 0
+    mod_rng = random.Random(py_rng.getrandbits(64))
+
+    for i, j in enumerate(idx_out):
+        ts_s = int(ts_sec_new[i])
+        ts_u = int(ts_usec_new[i])
+
+        if is_raw:
+            rec = buf[j]
+            if needs_mod:
+                # For raw, if mod needed, parse temporarily (performance hit, but correct)
+                try:
+                    pkt = Ether(rec[16:])  # Skip pcap header
+                    pkt_bytes = bytes(pkt)
+                except Exception as e:
+                    log.warning(f"Failed to parse raw record for mod: {e}, skipping mod")
+                    pkt_bytes = rec[16:]
+            else:
+                # No mod, direct patch and write
+                rec_patched = patch_ts(rec, ts_s, ts_u)
+                sink.write_raw_record(rec_patched)
+                out_count += 1
+                continue
+        else:
             pkt_bytes = buf[j][2]
 
-            # Calculate needs_mod once per packet (same for all as it's plan-dependent)
-            needs_mod = any(str(s.get("type", "")).lower() in NEED_PARSE_OPS for s in plan)
-            if needs_mod:
+        if needs_mod:
+            try:
                 pkt = Ether(pkt_bytes)
-                modified_flag = False  # Track if any modification happened
-                for step in plan:
-                    t = str(step.get("type", "")).lower()
-                    # Skip if not a content-level perturbation (avoid double-applying index-level ones)
-                    if t not in NEED_PARSE_OPS:
-                        continue
-                    p = float(step.get("pct", 0.0))
-                    if mod_rng.random() < p:
-                        func = PERTURBATIONS.get(t)
-                        if func:
-                            params = step.get("params", {})
-                            modified = func(pkt, **params)
-                            if modified is None:
-                                modified_flag = True
-                                break  # Skip writing this packet entirely
-                            elif isinstance(modified, list):
-                                for m in modified:
-                                    sink.write_raw(ts_s, ts_u, bytes(m))
-                                    out_count += 1
-                                modified_flag = True
-                                break  # Skip original after writing list
-                            else:
-                                pkt = modified
-                                modified_flag = True
-                    if t == "seq_offset":
-                        new_bytes = bytes(pkt)
-                        if len(new_bytes) != len(pkt_bytes):
-                            log.warning(f"Seq offset changed packet length from {len(pkt_bytes)} to {len(new_bytes)}, reverting to original")
-                            pkt_bytes = pkt_bytes  # Revert to avoid loss
-                        else:
-                            pkt_bytes = new_bytes
-                        out_count += 1
-                if not modified_flag or (modified is not None and not isinstance(modified, list)):
-                    # Only write if not skipped by None or list
-                    pkt_bytes = bytes(pkt)
-                    sink.write_raw(ts_s, ts_u, pkt_bytes)
-                    out_count += 1
-                continue  # Note: this continue is not needed, but if you want to skip something
-            else:
-                # No mod needed, direct write
+            except Exception as e:
+                log.warning(f"Packet parse failed: {e}, skipping mod")
                 sink.write_raw(ts_s, ts_u, pkt_bytes)
                 out_count += 1
-        return n, out_count
+                continue
+
+            skip_packet = False
+            output_list = None
+            for step in plan:
+                t = str(step.get("type", "")).lower()
+                if t not in NEED_PARSE_OPS:
+                    continue
+                p = float(step.get("pct", 0.0))
+                if mod_rng.random() < p:
+                    func = PERTURBATIONS.get(t)
+                    if func:
+                        params = step.get("params", {})
+                        modified = func(pkt, **params)
+                        if modified is None:
+                            skip_packet = True
+                            break
+                        elif isinstance(modified, list):
+                            output_list = modified
+                            break
+                        else:
+                            pkt = modified
+
+            if skip_packet:
+                continue  # None: drop this packet
+
+            if output_list:
+                for m in output_list:
+                    sink.write_raw(ts_s, ts_u, bytes(m))
+                    out_count += 1
+                continue  # Wrote list, skip original
+
+            # Final check for seq_offset or other (outside loop)
+            pkt_bytes = bytes(pkt)
+            orig_len = len(buf[j][2]) if not is_raw else len(rec) - 16
+            if len(pkt_bytes) != orig_len:
+                log.warning(f"Modification changed length from {orig_len} to {len(pkt_bytes)}, reverting")
+                pkt_bytes = buf[j][2] if not is_raw else rec[16:]
+
+        # Write the (possibly modified) packet
+        if is_raw:
+            rec_patched = patch_ts(b'\x00'*16 + pkt_bytes, ts_s, ts_u)  # Dummy header, patch will fix
+            sink.write_raw_record(rec_patched)
+        else:
+            sink.write_raw(ts_s, ts_u, pkt_bytes)
+        out_count += 1
+
+    return n, out_count
 
 def _mix_seed(selection_seed: int, in_pcap: str) -> int:
     h = hashlib.blake2b(digest_size=8)
