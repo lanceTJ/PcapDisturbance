@@ -1,158 +1,172 @@
-# pcaplab
+# PcabDisturbance
 
-这是一个高性能流式PCAP扰动工具包，实现威胁模型I/II：
-- 数据包丢失、重传、TCP序列偏移
-- 数据包长度伪造、（离线）数据包速率修改占位符
-- 支持大型PCAP的流式分块处理
-- 目录批量运行器，镜像日期/PCAP目录结构，跳过`encrypted_pcaps`目录
+This is a high-performance streaming PCAP disturbance toolkit implementing Threat Model I/II:
 
-##  安装
+* Packet loss, retransmission, TCP sequence offset
+* Packet length forgery, (offline) packet-rate modification placeholder
+* Streaming chunk-based processing for large PCAPs
+* Directory batch runner, mirroring date/PCAP directory structure, skipping `encrypted_pcaps` directory
+
+## Installation
+
 ```bash
 pip install -e .
 ```
 
-##  扰动 Plan 说明
+## Usage
 
-###  Plan.json 整体结构
+### 1. Configuration Preparation
 
-`plan.json`是一个JSON数组，每个元素代表一个扰动步骤，按顺序执行：
+* Copy `config.example.yaml` to `config.yaml` and modify as needed.
+* Key fields:
 
-```json
-[
-  {
-    "type": "扰动类型",
-    "pct": "{百分比}",
-    "params": {
-      "参数名": "参数值"
-    }
-  }
-]
+  * `in_root`: Input PCAP directory path (e.g., `/data/en-cic2018/pcapdata`).
+  * `out_root`: Output directory for disturbed PCAPs (directory structure will be mirrored).
+  * `backend`: Processing backend (`threads` or `processes`; threads are good for I/O-bound workloads, processes for CPU-bound).
+  * `workers`: Number of concurrent workers (default 4, adjust based on your machine).
+  * `chunk_size`: Number of packets per chunk (default 5000, optimized for large files).
+  * `seed`: Random seed (default 42, ensures reproducibility).
+  * `plan`: Disturbance plan list; each disturbance step will run sequentially.
+
+### 2. Running the Tool
+
+Run batch processing using the CLI:
+
+```bash
+pcaplab --in-root <input_dir> --out-root <output_dir> --backend threads --workers 4 --chunk-size 5000 --seed 42 --plan plan.json
 ```
 
-###  支持的扰动类型及参数
+* `--plan`: Specify a JSON plan file (or use quick flags such as `--loss 0.1`).
+* Other quick flags (override the plan file):
 
-#####  1. **丢包 (loss)**
-```json
-{
-  "type": "loss",
-  "pct": 0.1,
-  "params": {}
-}
-```
-- **作用**：随机丢弃指定百分比的数据包
-- **参数**：无额外参数
-- **示例**：10%的数据包被丢弃
+  * `--loss <pct>`: Add packet loss (e.g., `--loss 0.1` drops 10% of packets).
+  * `--retransmit <pct>`: Add retransmission (e.g., `--retransmit 0.05` duplicates 5% of packets).
+  * `--seq-offset <pct:offset>`: Add sequence offset (e.g., `--seq-offset 0.02:500`).
+  * `--length-forge <pct:newlen>`: Add length forgery (e.g., `--length-forge 0.01:512`).
+* `--resume`: Skip files that already exist in output.
+* `--verbose`: Show detailed logs.
+* Example: processing the CICIDS2018 dataset and applying only reorder:
 
-#####  2. **重传 (retransmit/retrans)**
-```json
-{
-  "type": "retransmit",
-  "pct": 0.05,
-  "params": {}
-}
-```
-- **作用**：复制指定百分比的数据包
-- **参数**：无额外参数
-- **示例**：5%的数据包被复制一份
+  ```bash
+  pcaplab --in-root /data/cicids2018 --out-root /output/reordered --backend threads --workers 8 --chunk-size 10000 --seed 42 --plan reorder_plan.json
+  ```
 
-#####  3. **乱序 (reorder/jitter)**
-```json
-{
-  "type": "reorder",
-  "pct": 1.0,
-  "params": {}
-}
-```
-- **作用**：在chunk内打乱数据包顺序
-- **参数**：无额外参数
-- **注意**：`pct`参数在此类型中可能被忽略，整个chunk都会被打乱
+### 3. How to adjust config to apply different disturbance types with different parameters
 
-#####  4. **序列号偏移 (seq_offset)**
-```json
-{
-  "type": "seq_offset",
-  "pct": 0.02,
-  "params": {
-    "offset": 500
-  }
-}
-```
-- **作用**：修改TCP序列号
-- **参数**：
-  - `offset`：序列号偏移量（整数）
-- **技术细节**：仅影响TCP数据包，自动重新计算校验和
+Disturbances are defined in the `plan` array of `config.yaml`.
+They are applied sequentially (the output of one becomes the input of the next).
+Each element is a dictionary with:
 
-#####  5. **长度伪造 (length_forge)**
-```json
-{
-  "type": "length_forge",
-  "pct": 0.01,
-  "params": {
-    "new_len": 512,
-    "pad_byte": "00"
-  }
-}
-```
-- **作用**：修改数据包负载长度
-- **参数**：
-  - `new_len`：目标长度（整数）
-  - `pad_byte`：填充字节（十六进制字符串，可选）
+* `type` (disturbance type)
 
-###  完整配置示例
+* `pct` (application probability, float 0–1)
 
-```json
-[
-  {
-    "type": "loss",
-    "pct": 0.1,
-    "params": {}
-  },
-  {
-    "type": "retransmit", 
-    "pct": 0.05,
-    "params": {}
-  },
-  {
-    "type": "reorder",
-    "pct": 1.0,
-    "params": {}
-  },
-  {
-    "type": "seq_offset",
-    "pct": 0.02,
-    "params": {
-      "offset": 500
-    }
-  },
-  {
-    "type": "length_forge",
-    "pct": 0.01,
-    "params": {
-      "new_len": 512
-    }
-  }
-]
-```
+* `params` (optional parameter dict)
 
-###  执行流程说明
+* **Adjustment steps**:
 
-#####  1. **选择阶段** (`_select_indices`)
-- 按顺序应用`loss`、`retransmit`、`reorder`等扰动
-- 纯索引操作，不解析数据包内容
-- 统计每个扰动的效果
+  1. Edit the `plan` array: add/remove/reorder items.
+  2. Set `pct` to control the proportion of affected packets (e.g., 0.1 = 10%).
+  3. Configure parameters under `params` (use `{}` if none).
+  4. Note: order matters (e.g., loss before reorder applies reorder on the remaining packets); percentages can stack (same packet may get multiple disturbances); content-modifying types (e.g., seq_offset) reduce performance.
+  5. Save and run the CLI, or specify `--plan <file>`.
 
-#####  2. **修改阶段** (`_process_chunk`)
-- 仅对需要内容修改的扰动（`seq_offset`、`length_forge`）解析数据包
-- 使用零拷贝优化：大部分数据包不解析直接输出
+* **Supported disturbance types and examples**:
 
-#####  3. **性能优化**
-- **快路径**：无内容修改时直接输出原始字节
-- **懒解析**：仅对需要修改的数据包进行解析
-- **chunk处理**：批量处理提高效率
+##### 1. **Packet Loss (loss)**
 
-###  配置建议
+* Function: randomly drops `pct` of packets.
+* Adjustment: set `pct`; no params required.
+* Example (drop 20%):
 
-#####  网络异常模拟
+  ```yaml
+  plan:
+    - {type: loss, pct: 0.2, params: {}}
+  ```
+
+##### 2. **Retransmission (retransmit/retrans)**
+
+* Function: duplicates `pct` of packets, simulating retransmission.
+* Example (drop 10%, then retransmit 15% of the remaining packets):
+
+  ```yaml
+  plan:
+    - {type: loss, pct: 0.1, params: {}}
+    - {type: retransmit, pct: 0.15, params: {}}
+  ```
+
+##### 3. **Reorder / Jitter (reorder/jitter)**
+
+* Function: randomly shuffles segments within a chunk while keeping timestamps increasing.
+* Adjustment: `pct` controls trigger probability; `params.m` controls max segment length (default 5).
+* Example:
+
+  ```yaml
+  plan:
+    - {type: reorder, pct: 1.0, params: {m: 10}}
+  ```
+
+##### 4. **TCP Sequence Offset (seq_offset)**
+
+* Function: modifies TCP sequence numbers and recalculates checksums.
+* Example:
+
+  ```yaml
+  plan:
+    - {type: seq_offset, pct: 0.02, params: {offset: 1000}}
+  ```
+
+##### 5. **Length Forgery (length_forge)**
+
+* Function: modify payload length (pad if shorter, truncate if longer).
+
+* Example:
+
+  ```yaml
+  plan:
+    - {type: length_forge, pct: 0.01, params: {new_len: 1024, pad_byte: "00"}}
+  ```
+
+* **Full config example** (mixed disturbances):
+
+  ```yaml
+  in_root: /data/cicids2018
+  out_root: /output/perturbed
+  backend: threads
+  workers: 8
+  chunk_size: 10000
+  seed: 42
+  plan:
+    - {type: loss, pct: 0.1, params: {}}
+    - {type: retransmit, pct: 0.05, params: {}}
+    - {type: reorder, pct: 1.0, params: {m: 10}}
+    - {type: seq_offset, pct: 0.02, params: {offset: 500}}
+    - {type: length_forge, pct: 0.01, params: {new_len: 512, pad_byte: "00"}}
+  ```
+
+### Execution Flow Description
+
+##### 1. **Selection Phase** (`_select_indices`)
+
+* Applies disturbances like `loss`, `retransmit`, `reorder` in sequence
+* Index-only operations, no packet parsing
+* Statistics are collected per disturbance type
+
+##### 2. **Modification Phase** (`_process_chunk`)
+
+* Parses packets only if required by content-modifying disturbances (`seq_offset`, `length_forge`)
+* Zero-copy optimization: packets that don’t need modification are emitted directly
+
+##### 3. **Performance Optimization**
+
+* **Fast path**: no content modification → direct byte output
+* **Lazy parsing**: parse only packets needing modification
+* **Chunk processing**: improves throughput
+
+### Configuration Suggestions
+
+##### Network anomaly simulation
+
 ```json
 [
   {"type": "loss", "pct": 0.05, "params": {}},
@@ -161,7 +175,8 @@ pip install -e .
 ]
 ```
 
-#####  协议测试
+##### Protocol testing
+
 ```json
 [
   {"type": "seq_offset", "pct": 0.1, "params": {"offset": 1000}},
@@ -169,7 +184,8 @@ pip install -e .
 ]
 ```
 
-#####  压力测试  
+##### Stress testing
+
 ```json
 [
   {"type": "loss", "pct": 0.2, "params": {}},
@@ -178,11 +194,11 @@ pip install -e .
 ]
 ```
 
-###  注意事项
+### Notes
 
-1. **顺序重要性**：扰动按数组顺序执行，前一步的输出作为下一步的输入
-2. **百分比叠加**：多个扰动可能作用于同一个数据包
-3. **性能考虑**：内容修改类扰动（如`length_forge`）会触发数据包解析，影响性能
-4. **种子稳定性**：相同配置和种子会产生相同的扰动结果，便于测试复现
+1. **Order matters**: disturbances run sequentially, and each step sees the output of the previous one.
+2. **Percentages stack**: multiple disturbances may apply to the same packet.
+3. **Performance impact**: content-modifying disturbances (e.g., `length_forge`) require parsing.
+4. **Seed stability**: same config + same seed = deterministic output, useful for reproducible experiments.
 
-这种设计提供了灵活的扰动组合能力，可以模拟各种复杂的网络环境和攻击场景。
+This design provides flexible disturbance composition, enabling simulation of diverse network environments and attack scenarios.
