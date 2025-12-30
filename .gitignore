@@ -5,3 +5,5 @@ __pycache__/
 **/*.log
 
 /pcaplab_venv/
+
+/length_debug/test_out/
