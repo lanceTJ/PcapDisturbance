@@ -8,11 +8,11 @@ from .pipeline import apply_perturbations_stream
 from .utils import ensure_dir, is_encrypted_dir, log, now_iso
 
 def collect_pcaps(in_root: Path) -> list[Path]:
-    """收集所有以 'cap' 开头的文件（不依赖后缀名）。"""
+    """Collect all files starting with 'cap' (no extension dependency)."""
     pcaps = []
     for root, dirs, files in os_walk_skip_encrypted(in_root):
         for f in files:
-            if f.startswith("cap"):          # 简单前缀判断
+            if f.startswith("cap"):          # Simple prefix check
                 pcaps.append(Path(root) / f)
     return pcaps
 
@@ -24,16 +24,16 @@ def os_walk_skip_encrypted(in_root: Path):
 
 def _out_paths(in_pcap: Path, in_root: Path, out_root: Path):
     """
-    输出规则：
-      - 保留输入文件名原样（不带后缀的也原样保留），
-      - 最后统一 **追加 .pcap** 作为输出后缀。
-      - 元数据文件用原始名 + ".metadata.json"（不追加 .pcap），方便一眼对照源文件。
+    Output rules:
+      - Keep input filename as is (even without extension),
+      - Append .pcap as output suffix.
+      - Metadata uses original name + ".metadata.json".
     """
     rel = in_pcap.relative_to(in_root)
     date_dir = rel.parts[0] if len(rel.parts) >= 1 else "unknown_date"
     out_dir = out_root / date_dir
 
-    base_name = in_pcap.name                 # 例如：capDESKTOP-AN3U28N-172.31.64.17
+    base_name = in_pcap.name                 # e.g., capDESKTOP-AN3U28N-172.31.64.17
     out_name = f"{base_name}.pcap"           # -> capDESKTOP-AN3U28N-172.31.64.17.pcap
 
     out_pcap = out_dir / out_name
@@ -120,7 +120,6 @@ def run_threads(in_root: Path, out_root: Path, plan: List[Dict[str,Any]],
     return _run_common(pcaps, in_root, out_root, plan, chunk_size, selection_seed,
                        workers, verbose or per_file_log, resume, executor_factory)
 
-# pcaplab/batch.py（替换 run_processes）
 def run_processes(in_root: Path, out_root: Path, plan, chunk_size=10000,
                   selection_seed=0, workers=2, limit=None,
                   verbose=False, resume=False, per_file_log=False):
@@ -152,6 +151,4 @@ def run_processes(in_root: Path, out_root: Path, plan, chunk_size=10000,
                     log.error(f"[FAIL] {p.name}: {e}")
     except KeyboardInterrupt:
         log.warning("Interrupted by user, cancelling remaining tasks...")
-        # 交给 with 块退出时的 executor.shutdown 来清理；必要时可补充 os.killpg
     return results
-

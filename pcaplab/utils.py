@@ -1,3 +1,4 @@
+# pcaplab/utils.py (Unchanged, no Scapy/dpkt dependency)
 from __future__ import annotations
 from pathlib import Path
 import logging, json, os, re
@@ -141,7 +142,6 @@ def get_logger(name: Optional[str] = None) -> logging.Logger:
     lg = logging.getLogger(f"{_log_name}.{name}")
     lg.propagate = False
     if not lg.handlers and _configured:
-        # Child loggers also emit into the queue via parent
         pass
     return lg
 

@@ -1,4 +1,4 @@
-# pcaplab/cli.py
+# pcaplab/cli.py (Unchanged, but ensure plan parsing supports pad_byte str)
 import json, argparse
 from pathlib import Path
 from .batch import run_threads, run_processes
@@ -60,8 +60,8 @@ def main():
         workers=args.workers,
         limit=args.limit,
         verbose=args.verbose,
-        resume=args.resume,                # NEW
-        per_file_log=args.verbose          # NEW: print per-file as they finish
+        resume=args.resume,
+        per_file_log=args.verbose
     )
 
     # brief summary

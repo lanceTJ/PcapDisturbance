@@ -1,79 +1,87 @@
-# pcaplab/perturbations.py
-from scapy.layers.inet import IP, TCP, UDP
-from scapy.all import Raw  # Import Raw for payload injection
+# pcaplab/perturbations.py (Refactored to bytes-based, seq_offset uses struct/dpkt checksum)
+import struct
+import dpkt.ip  # For checksum calc
 
-# --- Core perturbations ---
-
-def perturb_packet_loss(pkt):
+def perturb_packet_loss(pkt_bytes):
     """Drop packet: return None."""
     return None
 
-def perturb_retransmit(pkt):
+def perturb_retransmit(pkt_bytes):
     """Duplicate packet."""
-    cp = pkt.copy()
-    return [pkt, cp]
+    return [pkt_bytes, pkt_bytes]
 
-def perturb_seq_offset(pkt, offset=1000):
-    """TCP sequence number offset. Recompute only checksums, preserve length to avoid payload loss."""
-    if TCP in pkt:
-        p2 = pkt.copy()
-        p2[TCP].seq = int(p2[TCP].seq) + int(offset)
-        if IP in p2:
-            del p2[IP].chksum  # Force IP checksum recalc
-        del p2[TCP].chksum  # Force TCP checksum recalc
-        # Explicitly set len to original to prevent scapy bugs
-        if IP in p2:
-            p2[IP].len = len(bytes(p2[IP]))  # Recalc len manually after changes
-        return p2
-    return pkt
+def perturb_seq_offset(pkt_bytes, offset=1000):
+    """Modify TCP seq number, recalc checksums, preserve length."""
+    # Assume Ethernet + IP + TCP (common); skip if not TCP
+    if len(pkt_bytes) < 54:  # Min Eth(14)+IP(20)+TCP(20)
+        return pkt_bytes
+    eth_hdr = pkt_bytes[:14]
+    if eth_hdr[12:14] != b'\x08\x00':  # Not IPv4
+        return pkt_bytes
+    ip_hdr = pkt_bytes[14:34]  # Assume min IP len 20
+    ip_len = (ip_hdr[0] & 0x0F) * 4
+    if len(pkt_bytes) < 14 + ip_len + 20:  # Min TCP 20
+        return pkt_bytes
+    proto = ip_hdr[9]
+    if proto != 6:  # Not TCP
+        return pkt_bytes
+    tcp_hdr_start = 14 + ip_len
+    tcp_hdr = pkt_bytes[tcp_hdr_start:tcp_hdr_start+20]
+    seq = struct.unpack("!I", tcp_hdr[4:8])[0]
+    new_seq = seq + int(offset)
+    new_tcp_hdr = tcp_hdr[:4] + struct.pack("!I", new_seq) + tcp_hdr[8:]
+    
+    # Recalc TCP checksum (dpkt way)
+    pseudo_hdr = ip_hdr[12:20] + b'\x00\x06' + struct.pack("!H", len(pkt_bytes) - 14 - ip_len)
+    tcp_data = pkt_bytes[tcp_hdr_start + 20:]
+    checksum = dpkt.in_cksum(pseudo_hdr + new_tcp_hdr + tcp_data)
+    new_tcp_hdr = new_tcp_hdr[:16] + struct.pack("!H", checksum) + new_tcp_hdr[18:]
+    
+    # Recalc IP checksum
+    new_ip_hdr = ip_hdr[:10] + b'\x00\x00' + ip_hdr[12:]
+    ip_checksum = dpkt.in_cksum(new_ip_hdr)
+    new_ip_hdr = new_ip_hdr[:10] + struct.pack("!H", ip_checksum) + new_ip_hdr[12:]
+    
+    return eth_hdr + new_ip_hdr + new_tcp_hdr + tcp_data
 
-def perturb_length_forgery(pkt, new_len=None, pad_byte=b"\x00"):
-    """Modify Raw payload length; if none, 1.5x. Convert pad_byte to bytes if str."""
-    # Convert pad_byte to bytes if it's a hex string
+def perturb_length_forge_bytes(pkt_bytes: bytes, new_len: int = None, pad_byte: str = "00") -> bytes:
+    """User-provided logic: force packet to new_len (truncate/pad)."""
+    if new_len is None:
+        new_len = max(1, int(len(pkt_bytes) * 1.5))
+    if new_len < 0:
+        raise ValueError("new_len must be >= 0")
+    # Parse pad_byte from str to byte (like user script)
     if isinstance(pad_byte, str):
-        try:
-            pad_byte = bytes.fromhex(pad_byte)
-            if len(pad_byte) != 1:
-                raise ValueError("pad_byte must be a single byte")
-        except ValueError:
-            pad_byte = b"\x00"  # Fallback to default if invalid
-
-    p2 = pkt.copy()
-    raw_layer = p2.getlayer("Raw")
-    if raw_layer is not None:
-        data = bytes(raw_layer.load)
-        target = int(new_len) if new_len else max(1, int(len(data) * 1.5))
-        if len(data) >= target:
-            raw_layer.load = data[:target]
+        pad_byte = pad_byte.strip().lower()
+        if pad_byte.startswith("0x"):
+            v = int(pad_byte, 16)
         else:
-            raw_layer.load = data + (pad_byte * (target - len(data)))
+            try:
+                v = int(pad_byte, 10)
+            except ValueError:
+                v = int(pad_byte, 16)
+        if not (0 <= v <= 255):
+            raise ValueError("pad_byte must be 0~255")
+        pad = bytes([v])
     else:
-        # inject dummy payload when none
-        dummy_payload = pad_byte * (new_len or 32)
-        p2 = p2 / Raw(load=dummy_payload)  # Use Raw to ensure bytes
-    if IP in p2:
-        if hasattr(p2[IP], "chksum"): del p2[IP].chksum
-        if hasattr(p2[IP], "len"):    del p2[IP].len
-    if TCP in p2 and hasattr(p2[TCP], "chksum"): del p2[TCP].chksum
-    if UDP in p2 and hasattr(p2[UDP], "chksum"): del p2[UDP].chksum
-    return p2
+        pad = bytes([pad_byte])
+    if len(pkt_bytes) >= new_len:
+        return pkt_bytes[:new_len]
+    return pkt_bytes + pad * (new_len - len(pkt_bytes))
 
 def perturb_rate_modify(buffered_pkts, delay_sec=0.05):
-    """
-    Offline pcap has no realtime clock; this is a placeholder to change local ordering/density.
-    Strategy: duplicate neighbors periodically to emulate jitter/gap.
-    """
+    """Placeholder: duplicate to emulate rate change."""
     out = []
     for i, p in enumerate(buffered_pkts):
         out.append(p)
         if i % 4 == 2:
-            out.append(buffered_pkts[max(0, i-1)].copy())
+            out.append(buffered_pkts[max(0, i-1)])
     return out
 
 PERTURBATIONS = {
     "loss": perturb_packet_loss,
     "retransmit": perturb_retransmit,
     "seq_offset": perturb_seq_offset,
-    "length_forge": perturb_length_forgery,
-    "rate_modify": perturb_rate_modify,  # works on buffered sequences (used rarely)
+    "length_forge": perturb_length_forge_bytes,
+    "rate_modify": perturb_rate_modify,
 }
