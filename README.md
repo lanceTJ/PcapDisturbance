@@ -1,204 +1,361 @@
 # PcabDisturbance
 
-This is a high-performance streaming PCAP disturbance toolkit implementing Threat Model I/II:
+PcabDisturbance is a **high-performance, dpkt-first, streaming PCAP disturbance toolkit** implementing Threat Model I/II.
 
-* Packet loss, retransmission, TCP sequence offset
-* Packet length forgery, (offline) packet-rate modification placeholder
-* Streaming chunk-based processing for large PCAPs
-* Directory batch runner, mirroring date/PCAP directory structure, skipping `encrypted_pcaps` directory
+Core design principles:
+
+- **Streaming stage pipeline**: each disturbance is a stage; stages are applied sequentially.
+- **Bytes-first fast path**: record-level disturbances operate on `(timestamp, raw_packet_bytes)` without protocol parsing.
+- **Lazy/limited parsing**: only content-modifying disturbances (e.g., `seq_offset`) touch headers.
+- **Deterministic & reproducible**: fixed seed yields repeatable results; **each stage has an independent RNG stream**
+  (stage randomness is not affected by earlier stages consuming random numbers).
+
+Supported capture format: **classic pcap** (no pcapng).
+
+---
+
+## Features
+
+- Packet loss (`loss`)
+- Retransmission / duplication (`retransmit` / `retrans`)
+- Length forgery (`length_forge`) — **forces entire packet bytes to fixed length**
+- Reorder / jitter (`reorder` / `jitter`) — **trigger-based window shuffle**, timestamps reassigned within the window
+- TCP sequence offset (`seq_offset`) — modifies TCP seq and recalculates checksums
+- Rate adjustment / speed change (`rate_adjust`) — **attack-only timestamp shift + reposition by timestamp**
+- Directory batch runner: mirrors date/PCAP directory structure; skips `encrypted_pcaps` directories
+
+---
 
 ## Installation
 
 ```bash
 pip install -e .
-```
+````
+
+Dependencies:
+
+* `dpkt`
+
+---
 
 ## Usage
 
-### 1. Configuration Preparation
+### 1) Configuration Preparation
 
 * Copy `config.example.yaml` to `config.yaml` and modify as needed.
-* Key fields:
 
-  * `in_root`: Input PCAP directory path (e.g., `/data/en-cic2018/pcapdata`).
-  * `out_root`: Output directory for disturbed PCAPs (directory structure will be mirrored).
-  * `backend`: Processing backend (`threads` or `processes`; threads are good for I/O-bound workloads, processes for CPU-bound).
-  * `workers`: Number of concurrent workers (default 4, adjust based on your machine).
-  * `chunk_size`: Number of packets per chunk (default 5000, optimized for large files).
-  * `seed`: Random seed (default 42, ensures reproducibility).
-  * `plan`: Disturbance plan list; each disturbance step will run sequentially.
+Key fields:
 
-### 2. Running the Tool
+* `in_root`: Input PCAP directory path (e.g., `/data/en-cic2018/pcapdata`).
+* `out_root`: Output directory for disturbed PCAPs (mirrors directory structure).
+* `backend`: `threads` or `processes`.
+* `workers`: number of concurrent workers.
+* `chunk_size`: number of packets per I/O batch (default 5000–10000 works well).
+* `seed`: random seed (reproducible).
+* `plan`: disturbance plan list; each step runs sequentially.
 
-Run batch processing using the CLI:
+### 2) Running the Tool
+
+Batch process via CLI:
 
 ```bash
 pcaplab --in-root <input_dir> --out-root <output_dir> --backend threads --workers 4 --chunk-size 5000 --seed 42 --plan plan.json
 ```
 
-* `--plan`: Specify a JSON plan file (or use quick flags such as `--loss 0.1`).
-* Other quick flags (override the plan file):
+Options:
 
-  * `--loss <pct>`: Add packet loss (e.g., `--loss 0.1` drops 10% of packets).
-  * `--retransmit <pct>`: Add retransmission (e.g., `--retransmit 0.05` duplicates 5% of packets).
-  * `--seq-offset <pct:offset>`: Add sequence offset (e.g., `--seq-offset 0.02:500`).
-  * `--length-forge <pct:newlen>`: Add length forgery (e.g., `--length-forge 0.01:512`).
-* `--resume`: Skip files that already exist in output.
-* `--verbose`: Show detailed logs.
-* Example: processing the CICIDS2018 dataset and applying only reorder:
+* `--plan`: JSON plan file (overrides quick flags).
 
-  ```bash
-  pcaplab --in-root /data/cicids2018 --out-root /output/reordered --backend threads --workers 8 --chunk-size 10000 --seed 42 --plan reorder_plan.json
-  ```
+* Quick flags (can be used instead of `--plan`):
 
-### 3. How to adjust config to apply different disturbance types with different parameters
+  * `--loss <pct>`: drop `pct` fraction of packets (e.g., `0.1` = 10%).
+  * `--retransmit <pct>`: duplicate `pct` fraction of packets.
+  * `--seq-offset <pct:offset>`: apply TCP seq offset to `pct` fraction of packets, e.g. `0.02:500`.
+  * `--length-forge <pct:newlen>`: force packet length to `newlen` for `pct` fraction of packets, e.g. `0.01:512`.
 
-Disturbances are defined in the `plan` array of `config.yaml`.
-They are applied sequentially (the output of one becomes the input of the next).
-Each element is a dictionary with:
+* `--resume`: skip files whose output already exists.
 
-* `type` (disturbance type)
+* `--verbose`: detailed logs.
 
-* `pct` (application probability, float 0–1)
+Example (apply reorder only):
 
-* `params` (optional parameter dict)
+```bash
+pcaplab --in-root /data/cicids2018 --out-root /output/reordered --backend threads --workers 8 --chunk-size 10000 --seed 42 --plan reorder_plan.json
+```
 
-* **Adjustment steps**:
+---
 
-  1. Edit the `plan` array: add/remove/reorder items.
-  2. Set `pct` to control the proportion of affected packets (e.g., 0.1 = 10%).
-  3. Configure parameters under `params` (use `{}` if none).
-  4. Note: order matters (e.g., loss before reorder applies reorder on the remaining packets); percentages can stack (same packet may get multiple disturbances); content-modifying types (e.g., seq_offset) reduce performance.
-  5. Save and run the CLI, or specify `--plan <file>`.
+## Plan Format
 
-* **Supported disturbance types and examples**:
+Disturbances are defined in the `plan` array (either in YAML config or in a JSON plan file).
+They are applied **sequentially**.
 
-##### 1. **Packet Loss (loss)**
+Each plan item:
 
-* Function: randomly drops `pct` of packets.
-* Adjustment: set `pct`; no params required.
-* Example (drop 20%):
+* `type`: disturbance type
+* `pct`: application probability / fraction (**float 0–1**)
+* `params`: optional parameters dict
 
-  ```yaml
-  plan:
-    - {type: loss, pct: 0.2, params: {}}
-  ```
+### Semantics Notes
 
-##### 2. **Retransmission (retransmit/retrans)**
+* **Order matters**: later stages operate on the output of earlier stages.
+* **Percentages stack**: the same packet can be affected by multiple stages.
+* **Independent RNG per stage**: stage A consuming randomness does not change stage B’s selection.
+* **Length forgery** operates on the **entire packet bytes**, not only payload; this may produce malformed packets for strict parsers.
+* `reorder` and `rate_adjust` involve buffering/repositioning; peak memory depends on configured window sizes.
 
-* Function: duplicates `pct` of packets, simulating retransmission.
-* Example (drop 10%, then retransmit 15% of the remaining packets):
+---
 
-  ```yaml
-  plan:
-    - {type: loss, pct: 0.1, params: {}}
-    - {type: retransmit, pct: 0.15, params: {}}
-  ```
+## Supported Disturbances
 
-##### 3. **Reorder / Jitter (reorder/jitter)**
+### 1) Packet Loss (`loss`)
 
-* Function: randomly shuffles segments within a chunk while keeping timestamps increasing.
-* Adjustment: `pct` controls trigger probability; `params.m` controls max segment length (default 5).
-* Example:
+* Randomly drops `pct` fraction of packets.
+* Params: none.
 
-  ```yaml
-  plan:
-    - {type: reorder, pct: 1.0, params: {m: 10}}
-  ```
+```yaml
+plan:
+  - {type: loss, pct: 0.2, params: {}}
+```
 
-##### 4. **TCP Sequence Offset (seq_offset)**
+### 2) Retransmission (`retransmit` / `retrans`)
 
-* Function: modifies TCP sequence numbers and recalculates checksums.
-* Example:
+* Duplicates `pct` fraction of packets.
 
-  ```yaml
-  plan:
-    - {type: seq_offset, pct: 0.02, params: {offset: 1000}}
-  ```
+Params (optional):
 
-##### 5. **Length Forgery (length_forge)**
+* `copies` (default `1`): number of additional copies per selected packet
+* `delay_ms` (default `0.0`): timestamp offset per copy (ms)
 
-* Function: modify payload length (pad if shorter, truncate if longer).
+```yaml
+plan:
+  - {type: loss, pct: 0.1, params: {}}
+  - {type: retransmit, pct: 0.15, params: {copies: 1, delay_ms: 0.0}}
+```
 
-* Example:
+### 3) Reorder / Jitter (`reorder` / `jitter`)
 
-  ```yaml
-  plan:
-    - {type: length_forge, pct: 0.01, params: {new_len: 1024, pad_byte: "00"}}
-  ```
+* With probability `pct`, a packet becomes a **trigger point**.
+* The trigger packet + the **next `k` packets** are shuffled.
+* Timestamps are reassigned inside the window to keep ordering in the window.
 
-* **Full config example** (mixed disturbances):
+Params:
 
-  ```yaml
-  in_root: /data/cicids2018
-  out_root: /output/perturbed
-  backend: threads
-  workers: 8
-  chunk_size: 10000
-  seed: 42
-  plan:
-    - {type: loss, pct: 0.1, params: {}}
-    - {type: retransmit, pct: 0.05, params: {}}
-    - {type: reorder, pct: 1.0, params: {m: 10}}
-    - {type: seq_offset, pct: 0.02, params: {offset: 500}}
-    - {type: length_forge, pct: 0.01, params: {new_len: 512, pad_byte: "00"}}
-  ```
+* `k` (preferred): number of packets after the trigger (window size is `k+1`)
+* `m` (compat): treated as `k` if `k` not provided
+* `ts_mode`:
 
-### Execution Flow Description
+  * `keep` (default): reuse the original timestamps (sorted) and assign to the shuffled packets
+  * `linear`: interpolate timestamps from window min to max
 
-##### 1. **Selection Phase** (`_select_indices`)
+```yaml
+plan:
+  - {type: reorder, pct: 0.05, params: {k: 20, ts_mode: keep}}
+```
 
-* Applies disturbances like `loss`, `retransmit`, `reorder` in sequence
-* Index-only operations, no packet parsing
-* Statistics are collected per disturbance type
+### 4) TCP Sequence Offset (`seq_offset`)
 
-##### 2. **Modification Phase** (`_process_chunk`)
+* Modifies TCP sequence numbers by `offset` for `pct` fraction of packets.
+* Recalculates IP and TCP checksums (best-effort; non-IPv4/TCP packets pass through unchanged).
 
-* Parses packets only if required by content-modifying disturbances (`seq_offset`, `length_forge`)
-* Zero-copy optimization: packets that don’t need modification are emitted directly
+Params:
 
-##### 3. **Performance Optimization**
+* `offset` (default `1000`)
 
-* **Fast path**: no content modification → direct byte output
-* **Lazy parsing**: parse only packets needing modification
-* **Chunk processing**: improves throughput
+```yaml
+plan:
+  - {type: seq_offset, pct: 0.02, params: {offset: 1000}}
+```
 
-### Configuration Suggestions
+### 5) Length Forgery (`length_forge`)
 
-##### Network anomaly simulation
+* With probability `pct`, forces the **entire packet bytes** to `new_len`:
+
+  * If longer: truncate
+  * If shorter: pad with `pad_byte`
+* **No** checksum recalculation and **no** IP/TCP/UDP length-field repair.
+
+Params:
+
+* `new_len` (required)
+* `pad_byte` (optional, default `"00"`): `"00"`, `"0x0f"`, `"15"`, etc.
+
+Optional matching (apply only to “attack packets”):
+
+* `params.match.time_ranges`: list of `"start,end"` (pcap timestamps, seconds; inclusive)
+* `params.match.ips`: list of IP strings
+* `params.match.ip_match`: `either` (default) / `src` / `dst`
+
+```yaml
+plan:
+  - type: length_forge
+    pct: 0.01
+    params:
+      new_len: 1024
+      pad_byte: "0x0f"
+      match:
+        time_ranges: ["1700000000,1700000100"]
+        ips: ["192.0.2.1"]
+        ip_match: either
+```
+
+### 6) Rate Adjustment / Speed Change (`rate_adjust`)
+
+Purpose:
+
+* Identify “attack packets” (by time range and/or IP label),
+* with probability `pct` shift their timestamp **forward** by `shift_ms`,
+* then **reposition packets by (possibly modified) timestamps**.
+
+Implementation:
+
+* `rate_adjust` compiles into two stages:
+
+  1. `RateAdjustStage`: adds `shift_ms` to selected attack packets’ timestamps
+  2. `OnlineTimeSorter`: reorders output by timestamp under a bounded-delay assumption
+
+Bounded-delay assumption:
+
+* This pipeline guarantees correct online sorting if timestamps are only shifted **forward** by at most `max_delay_ms`.
+
+Params:
+
+* `shift_ms` (required): forward shift in milliseconds
+* `max_delay_ms` (optional): upper bound on forward shift; must be `>= shift_ms` (default = `shift_ms`)
+* `match` (required): attack matcher configuration
+
+Matcher (`params.match`):
+
+* `time_ranges`: list of `"start,end"` (pcap timestamps in seconds; inclusive)
+* `ips`: list of IP strings
+* `ip_match`: `either` (default) / `src` / `dst`
+
+```yaml
+plan:
+  - type: rate_adjust
+    pct: 0.30
+    params:
+      shift_ms: 50
+      max_delay_ms: 50
+      match:
+        time_ranges: ["1700000000,1700000100"]
+        ips: ["192.0.2.1"]
+        ip_match: either
+```
+
+---
+
+## Full Config Example
+
+```yaml
+in_root: /data/cicids2018
+out_root: /output/perturbed
+backend: threads
+workers: 8
+chunk_size: 10000
+seed: 42
+plan:
+  - {type: loss, pct: 0.10, params: {}}
+  - {type: retransmit, pct: 0.05, params: {copies: 1, delay_ms: 0.0}}
+  - {type: reorder, pct: 0.05, params: {k: 20, ts_mode: keep}}
+  - {type: seq_offset, pct: 0.02, params: {offset: 500}}
+  - type: length_forge
+    pct: 0.01
+    params:
+      new_len: 512
+      pad_byte: "00"
+      match:
+        time_ranges: ["1700000000,1700000100"]
+        ips: ["192.0.2.1"]
+        ip_match: either
+  - type: rate_adjust
+    pct: 0.30
+    params:
+      shift_ms: 50
+      max_delay_ms: 50
+      match:
+        time_ranges: ["1700000000,1700000100"]
+        ips: ["192.0.2.1"]
+        ip_match: either
+```
+
+---
+
+## Execution Flow (Pipeline)
+
+1. **Streaming Read**
+
+   * Reads classic pcap records as `(timestamp, packet_bytes)`.
+
+2. **Stage Pipeline**
+
+   * Each plan item compiles into one or more stages.
+   * Records flow through stages; each stage may drop, duplicate, rewrite bytes, or buffer/reorder.
+
+3. **Streaming Write**
+
+   * Writes output records via `dpkt.pcap.Writer`.
+
+### Performance Notes
+
+* Record-level operations (`loss`, `retransmit`, `reorder`, `length_forge`, `rate_adjust`) are bytes-first and fast.
+* Content-modifying operations (`seq_offset`) cost more due to header touch + checksum recalculation.
+* Increasing `chunk_size` can improve throughput by reducing Python overhead; typical 5k–20k is reasonable.
+
+---
+
+## Configuration Suggestions
+
+### Network anomaly simulation
 
 ```json
 [
   {"type": "loss", "pct": 0.05, "params": {}},
-  {"type": "retransmit", "pct": 0.03, "params": {}},
-  {"type": "reorder", "pct": 1.0, "params": {}}
+  {"type": "retransmit", "pct": 0.03, "params": {"copies": 1, "delay_ms": 0}},
+  {"type": "reorder", "pct": 0.02, "params": {"k": 10, "ts_mode": "keep"}},
+  {
+    "type": "rate_adjust",
+    "pct": 0.30,
+    "params": {
+      "shift_ms": 50,
+      "max_delay_ms": 50,
+      "match": {"time_ranges": ["1700000000,1700000100"], "ips": ["192.0.2.1"], "ip_match": "either"}
+    }
+  }
 ]
 ```
 
-##### Protocol testing
+### Protocol testing
 
 ```json
 [
   {"type": "seq_offset", "pct": 0.1, "params": {"offset": 1000}},
-  {"type": "length_forge", "pct": 0.05, "params": {"new_len": 1500}}
+  {"type": "length_forge", "pct": 0.05, "params": {"new_len": 1500, "pad_byte": "00"}}
 ]
 ```
 
-##### Stress testing
+### Stress testing
 
 ```json
 [
   {"type": "loss", "pct": 0.2, "params": {}},
-  {"type": "retransmit", "pct": 0.15, "params": {}},
-  {"type": "length_forge", "pct": 0.1, "params": {"new_len": 2048}}
+  {"type": "retransmit", "pct": 0.15, "params": {"copies": 1}},
+  {"type": "length_forge", "pct": 0.1, "params": {"new_len": 2048, "pad_byte": "00"}}
 ]
 ```
 
-### Notes
+---
 
-1. **Order matters**: disturbances run sequentially, and each step sees the output of the previous one.
+## Notes / Caveats
+
+1. **Order matters**: disturbances run sequentially.
 2. **Percentages stack**: multiple disturbances may apply to the same packet.
-3. **Performance impact**: content-modifying disturbances (e.g., `length_forge`) require parsing.
-4. **Seed stability**: same config + same seed = deterministic output, useful for reproducible experiments.
+3. **Length forgery can create malformed packets**: downstream flow tools may drop/ignore such packets.
+4. **Determinism**: same plan + same seed + same input path → deterministic output.
+   Stage RNGs are derived independently to avoid cross-stage coupling.
+5. **Rate adjustment is forward-only**: `rate_adjust` assumes timestamps shift forward by at most `max_delay_ms`.
+   If you need arbitrary (forward/backward) shifts or large reordering, implement an external-sort based stage.
 
-This design provides flexible disturbance composition, enabling simulation of diverse network environments and attack scenarios.
+```
+::contentReference[oaicite:0]{index=0}
+```
