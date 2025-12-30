@@ -1,4 +1,5 @@
-# pcaplab/pipeline.py (replace most logic)
+# pcaplab/pipeline.py
+
 from __future__ import annotations
 
 import hashlib
@@ -11,10 +12,15 @@ import dpkt
 from .core import Record, Stage
 from .match import AttackMatcher, parse_time_ranges
 from .stages import (
-    DropStage, RetransmitStage, LengthForgeStage, ReorderStage,
-    RateAdjustStage, OnlineTimeSorter, SeqOffsetStage
+    DropStage,
+    RetransmitStage,
+    LengthForgeStage,
+    ReorderStage,
+    RateAdjustStage,
+    OnlineTimeSorter,
+    SeqOffsetStage,
 )
-from .stream import _sniff_kind, stream_pcap_packets, stream_pcap_packets_fast
+from .stream import _sniff_kind, stream_pcap_packets_fast
 from .utils import log
 
 
@@ -63,51 +69,89 @@ def _build_matcher(params: Dict[str, Any]) -> Optional[AttackMatcher]:
     return AttackMatcher(time_ranges=tr, ips=ips, match_on=ip_match)
 
 
-def compile_plan_to_stages(plan: List[dict], rng: random.Random) -> List[Stage]:
+# -----------------------------
+# RNG derivation (fixes coupling)
+# -----------------------------
+
+def _stable_tag_hash64(tag: str) -> int:
+    """
+    Stable 64-bit hash for tags (independent of Python's randomized hash seed).
+    """
+    h = hashlib.blake2b(tag.encode("utf-8"), digest_size=8)
+    return int.from_bytes(h.digest(), "little")
+
+
+def _derive_rng(master: random.Random, tag: str) -> random.Random:
+    """
+    Derive an independent RNG stream for each stage.
+    - Uses master.getrandbits(64) to incorporate the run seed.
+    - Mixes in a stable hash of the stage tag to avoid dependence on Python's hash randomization.
+    """
+    seed64 = master.getrandbits(64) ^ _stable_tag_hash64(tag)
+    return random.Random(seed64)
+
+
+def compile_plan_to_stages(plan: List[dict], master_rng: random.Random) -> List[Stage]:
+    """
+    Compile plan steps into a list of streaming stages.
+
+    IMPORTANT:
+      Each stage receives its own RNG derived from master_rng, so random decisions are independent
+      across stages (fixing the coupling issue).
+    """
     stages: List[Stage] = []
 
-    for step in plan:
+    for i, step in enumerate(plan):
         t = str(step.get("type", "")).lower()
-        pct = float(step.get("pct", 0.0))  # your config uses 0..1
-
+        pct = float(step.get("pct", 0.0))  # config uses 0..1
         params = step.get("params", {}) or {}
 
+        stage_rng = _derive_rng(master_rng, f"{i}:{t}")
+
         if t == "loss":
-            stages.append(DropStage(pct=pct, rng=rng))
+            stages.append(DropStage(pct=pct, rng=stage_rng))
 
         elif t in {"retrans", "retransmit"}:
             copies = int(params.get("copies", 1))
             delay_ms = float(params.get("delay_ms", 0.0))
-            stages.append(RetransmitStage(pct=pct, copies=copies, delay_ms=delay_ms, rng=rng))
+            stages.append(RetransmitStage(pct=pct, copies=copies, delay_ms=delay_ms, rng=stage_rng))
 
         elif t in {"length_forge", "length-forge", "lenfake"}:
             new_len = int(params.get("new_len"))
             pad_byte = _parse_pad_byte(params.get("pad_byte", "00"))
             matcher = _build_matcher(params)
-            stages.append(LengthForgeStage(pct=pct, new_len=new_len, pad_byte=pad_byte, rng=rng, matcher=matcher))
+            stages.append(
+                LengthForgeStage(
+                    pct=pct,
+                    new_len=new_len,
+                    pad_byte=pad_byte,
+                    rng=stage_rng,
+                    matcher=matcher,
+                )
+            )
 
         elif t in {"reorder", "jitter"}:
-            # align to your new spec: trigger with pct; shuffle k packets after trigger
-            # keep compatibility: if user gives params.m (old), treat as k = m
+            # Compatibility: prefer params.k; fallback to old params.m
             k = int(params.get("k", params.get("m", 5)))
             ts_mode = str(params.get("ts_mode", "keep")).lower()
-            stages.append(ReorderStage(pct=pct, k=k, rng=rng, ts_mode=ts_mode))
+            stages.append(ReorderStage(pct=pct, k=k, rng=stage_rng, ts_mode=ts_mode))
 
         elif t == "seq_offset":
             offset = int(params.get("offset", 1000))
-            stages.append(SeqOffsetStage(pct=pct, rng=rng, offset=offset))
+            stages.append(SeqOffsetStage(pct=pct, rng=stage_rng, offset=offset))
 
         elif t in {"rate", "rate_adjust", "speed", "delay"}:
-            # shift attack packets forward and then reorder by ts (bounded)
             matcher = _build_matcher(params)
             if matcher is None:
                 raise ValueError("rate_adjust requires params.match")
+
             shift_ms = float(params.get("shift_ms", params.get("s_ms", 0.0)))
             max_delay_ms = float(params.get("max_delay_ms", shift_ms))
             if max_delay_ms < shift_ms:
                 raise ValueError("max_delay_ms must be >= shift_ms for OnlineTimeSorter correctness")
 
-            stages.append(RateAdjustStage(pct=pct, shift_ms=shift_ms, rng=rng, matcher=matcher))
+            # Note: RateAdjustStage and OnlineTimeSorter are separate stages.
+            stages.append(RateAdjustStage(pct=pct, shift_ms=shift_ms, rng=stage_rng, matcher=matcher))
             stages.append(OnlineTimeSorter(max_delay_ms=max_delay_ms))
 
         else:
@@ -125,8 +169,11 @@ def apply_perturbations_stream(
     show_progress: bool = False,
     progress_every: int = 200_000,
 ):
+    """
+    Stream records from in_pcap, apply stage pipeline, write to out_pcap.
+    """
     py_seed = _mix_seed(selection_seed, in_pcap)
-    rng = random.Random(py_seed)
+    master_rng = random.Random(py_seed)
     stats = defaultdict(int)
 
     # detect linktype
@@ -134,18 +181,14 @@ def apply_perturbations_stream(
         reader = dpkt.pcap.Reader(f)
         linktype = reader.datalink()
 
-    out_f = open(out_pcap, "wb")
-    writer = dpkt.pcap.Writer(out_f, linktype=linktype)
-
-    # choose stream
     kind = _sniff_kind(in_pcap)
     if kind != "pcap":
-        raise ValueError("Current pipeline supports classic pcap only (pcapng not supported yet).")
+        raise ValueError("Current pipeline supports classic pcap only (pcapng not supported).")
 
-    # fast stream always ok because our stages consume (ts, bytes)
-    stream_func = stream_pcap_packets_fast
+    stages = compile_plan_to_stages(perturb_plan, master_rng)
 
-    stages = compile_plan_to_stages(perturb_plan, rng)
+    out_f = open(out_pcap, "wb")
+    writer = dpkt.pcap.Writer(out_f, linktype=linktype)
 
     total_in = 0
     total_out = 0
@@ -155,14 +198,14 @@ def apply_perturbations_stream(
         for st in stages:
             nxt: List[Record] = []
             for r in recs:
-                out_iter = list(st.feed(r))
-                nxt.extend(out_iter)
+                nxt.extend(list(st.feed(r)))
             recs = nxt
         return recs
 
     try:
         buf: List[Tuple[float, bytes, int]] = []
-        for idx, (ts, pkt) in enumerate(stream_func(in_pcap)):
+
+        for idx, (ts, pkt) in enumerate(stream_pcap_packets_fast(in_pcap)):
             buf.append((ts, pkt, idx))
             if len(buf) >= chunk_size:
                 for ts0, pkt0, idx0 in buf:
@@ -171,8 +214,10 @@ def apply_perturbations_stream(
                     for r in out_recs:
                         writer.writepkt(r.buf, ts=r.ts)
                         total_out += 1
+
                 if show_progress and total_in // progress_every != (total_in - len(buf)) // progress_every:
                     log.info(f"[progress] {in_pcap} in={total_in} out={total_out}")
+
                 buf.clear()
 
         if buf:
@@ -185,8 +230,6 @@ def apply_perturbations_stream(
             buf.clear()
 
         # flush stages (important for reorder/sorter)
-        tail: List[Record] = []
-        # stage-by-stage flush propagation
         for i, st in enumerate(stages):
             flushed = list(st.flush())
             if not flushed:
