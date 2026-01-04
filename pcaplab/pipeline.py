@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import dpkt
 
 from .core import Record, Stage
+from .rule_matcher import YamlRulePacketMatcher
 from .match import AttackMatcher, parse_time_ranges
 from .stages import (
     DropStage,
@@ -52,20 +53,32 @@ def _parse_pad_byte(pad_byte: Any) -> int:
     return v
 
 
-def _build_matcher(params: Dict[str, Any]) -> Optional[AttackMatcher]:
+def _build_matcher(params: Dict[str, Any]):
     """
-    Optional in params:
-      match:
-        time_ranges: ["start,end", ...]   # float seconds (pcap ts)
-        ips: ["1.2.3.4", "2001:db8::1"]
-        ip_match: "either"|"src"|"dst"
+    New semantics:
+      params.match is a YAML rules file path (string), or:
+        match:
+          rules_path: "/path/to/cic2018_improved_rules.yaml"
+          include_labels: ["Botnet Ares", ...]   # optional
+
+    Returns:
+      YamlRulePacketMatcher or None
     """
     m = params.get("match")
     if not m:
         return None
-    tr = parse_time_ranges(m.get("time_ranges", []))
-    ips = set(m.get("ips", []))
-    ip_match = m.get("ip_match", "either")
+
+    if isinstance(m, str):
+        return YamlRulePacketMatcher(rules_path=m)
+
+    if isinstance(m, dict):
+        path = m.get("rules_path") or m.get("path") or m.get("yaml")
+        if not path:
+            raise ValueError("match dict requires rules_path/path/yaml")
+        include_labels = m.get("include_labels")
+        return YamlRulePacketMatcher(rules_path=str(path), include_labels=include_labels)
+
+    raise ValueError(f"Unsupported match type: {type(m)}")
     return AttackMatcher(time_ranges=tr, ips=ips, match_on=ip_match)
 
 
@@ -92,18 +105,11 @@ def _derive_rng(master: random.Random, tag: str) -> random.Random:
 
 
 def compile_plan_to_stages(plan: List[dict], master_rng: random.Random) -> List[Stage]:
-    """
-    Compile plan steps into a list of streaming stages.
-
-    IMPORTANT:
-      Each stage receives its own RNG derived from master_rng, so random decisions are independent
-      across stages (fixing the coupling issue).
-    """
     stages: List[Stage] = []
 
     for i, step in enumerate(plan):
         t = str(step.get("type", "")).lower()
-        pct = float(step.get("pct", 0.0))  # config uses 0..1
+        pct = float(step.get("pct", 0.0))
         params = step.get("params", {}) or {}
 
         stage_rng = _derive_rng(master_rng, f"{i}:{t}")
@@ -119,19 +125,10 @@ def compile_plan_to_stages(plan: List[dict], master_rng: random.Random) -> List[
         elif t in {"length_forge", "length-forge", "lenfake"}:
             new_len = int(params.get("new_len"))
             pad_byte = _parse_pad_byte(params.get("pad_byte", "00"))
-            matcher = _build_matcher(params)
-            stages.append(
-                LengthForgeStage(
-                    pct=pct,
-                    new_len=new_len,
-                    pad_byte=pad_byte,
-                    rng=stage_rng,
-                    matcher=matcher,
-                )
-            )
+            matcher = _build_matcher(params)  # <- YAML matcher (optional)
+            stages.append(LengthForgeStage(pct=pct, new_len=new_len, pad_byte=pad_byte, rng=stage_rng, matcher=matcher))
 
         elif t in {"reorder", "jitter"}:
-            # Compatibility: prefer params.k; fallback to old params.m
             k = int(params.get("k", params.get("m", 5)))
             ts_mode = str(params.get("ts_mode", "keep")).lower()
             stages.append(ReorderStage(pct=pct, k=k, rng=stage_rng, ts_mode=ts_mode))
@@ -143,14 +140,12 @@ def compile_plan_to_stages(plan: List[dict], master_rng: random.Random) -> List[
         elif t in {"rate", "rate_adjust", "speed", "delay"}:
             matcher = _build_matcher(params)
             if matcher is None:
-                raise ValueError("rate_adjust requires params.match")
-
+                raise ValueError("rate_adjust requires params.match as YAML rules path (string) or dict")
             shift_ms = float(params.get("shift_ms", params.get("s_ms", 0.0)))
             max_delay_ms = float(params.get("max_delay_ms", shift_ms))
             if max_delay_ms < shift_ms:
                 raise ValueError("max_delay_ms must be >= shift_ms for OnlineTimeSorter correctness")
 
-            # Note: RateAdjustStage and OnlineTimeSorter are separate stages.
             stages.append(RateAdjustStage(pct=pct, shift_ms=shift_ms, rng=stage_rng, matcher=matcher))
             stages.append(OnlineTimeSorter(max_delay_ms=max_delay_ms))
 

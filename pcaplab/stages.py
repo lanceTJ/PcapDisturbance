@@ -6,13 +6,14 @@ import heapq
 import ipaddress
 import random
 from dataclasses import dataclass
-from typing import Deque, Iterable, List, Optional, Tuple
+from typing import Deque, Iterable, List, Optional, Tuple, Any
 from collections import deque
 
 import dpkt
 
 from .core import Record, Stage
 from .match import AttackMatcher
+from .rule_matcher import YamlRulePacketMatcher
 
 
 def parse_l3_addrs(buf: bytes) -> Tuple[Optional[str], Optional[str], str]:
@@ -48,6 +49,19 @@ def fixed_len_bytes(buf: bytes, new_len: int, pad_byte: int) -> bytes:
     return buf + bytes([pad_byte]) * (new_len - len(buf))
 
 
+def _match_packet(matcher: Any, rec: Record) -> bool:
+    """
+    matcher compatibility layer:
+      - YamlRulePacketMatcher: matcher.match_packet(ts, buf)
+      - legacy AttackMatcher: matcher.is_attack(ts, src_ip, dst_ip) requires L3 parse (not used here)
+    """
+    if matcher is None:
+        return True
+    mp = getattr(matcher, "match_packet", None)
+    if callable(mp):
+        return bool(mp(rec.ts, rec.buf))
+    raise TypeError(f"Unsupported matcher type: {type(matcher)}")
+
 @dataclass
 class DropStage(Stage):
     pct: float  # 0..1
@@ -82,14 +96,13 @@ class LengthForgeStage(Stage):
     new_len: int
     pad_byte: int
     rng: random.Random
-    matcher: Optional[AttackMatcher] = None  # None => apply to all packets
+    matcher: Optional[Any] = None  # <- accept YamlRulePacketMatcher
 
     def feed(self, rec: Record) -> Iterable[Record]:
-        if self.matcher is not None:
-            src, dst, _ = parse_l3_addrs(rec.buf)
-            if not self.matcher.is_attack(rec.ts, src, dst):
-                return [rec]
+        if self.matcher is not None and not _match_packet(self.matcher, rec):
+            return [rec]
         if self.rng.random() < self.pct:
+            from .stages import fixed_len_bytes  # or keep your local helper
             nb = fixed_len_bytes(rec.buf, self.new_len, self.pad_byte)
             return [Record(ts=rec.ts, buf=nb, idx=rec.idx)]
         return [rec]
@@ -201,11 +214,10 @@ class RateAdjustStage(Stage):
     pct: float  # 0..1
     shift_ms: float
     rng: random.Random
-    matcher: AttackMatcher
+    matcher: Any  # <- required, typically YamlRulePacketMatcher
 
     def feed(self, rec: Record) -> Iterable[Record]:
-        src, dst, _ = parse_l3_addrs(rec.buf)
-        if self.matcher.is_attack(rec.ts, src, dst) and self.rng.random() < self.pct:
+        if _match_packet(self.matcher, rec) and self.rng.random() < self.pct:
             return [Record(ts=rec.ts + self.shift_ms / 1000.0, buf=rec.buf, idx=rec.idx)]
         return [rec]
 
