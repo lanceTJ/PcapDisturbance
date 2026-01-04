@@ -355,7 +355,3 @@ plan:
    Stage RNGs are derived independently to avoid cross-stage coupling.
 5. **Rate adjustment is forward-only**: `rate_adjust` assumes timestamps shift forward by at most `max_delay_ms`.
    If you need arbitrary (forward/backward) shifts or large reordering, implement an external-sort based stage.
-
-```
-::contentReference[oaicite:0]{index=0}
-```
