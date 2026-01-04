@@ -1,0 +1,32 @@
+[
+  {"type": "loss", "pct": 0.02, "params": {}},
+  {"type": "retransmit", "pct": 0.01, "params": {"copies": 2, "delay_ms": 0.2}},
+  {"type": "reorder", "pct": 0.005, "params": {"k": 30, "ts_mode": "keep"}},
+  {"type": "seq_offset", "pct": 0.002, "params": {"offset": 500}},
+  {
+    "type": "length_forge",
+    "pct": 0.01,
+    "params": {
+      "new_len": 512,
+      "pad_byte": "0x0f",
+      "match": {
+        "rules_path": "/ABS/PATH/TO/cic2018_improved_rules.yaml",
+        "include_labels": [
+          "Botnet Ares",
+          "Infiltration - NMAP Portscan",
+          "Infiltration - Dropbox Download",
+          "Infiltration - Communication Victim Attacker"
+        ]
+      }
+    }
+  },
+  {
+    "type": "rate_adjust",
+    "pct": 0.30,
+    "params": {
+      "shift_ms": 50,
+      "max_delay_ms": 50,
+      "match": "/ABS/PATH/TO/cic2018_improved_rules.yaml"
+    }
+  }
+]
