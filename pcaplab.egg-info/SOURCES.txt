@@ -3,8 +3,13 @@ pyproject.toml
 pcaplab/__init__.py
 pcaplab/batch.py
 pcaplab/cli.py
+pcaplab/core.py
+pcaplab/io.py
+pcaplab/match.py
 pcaplab/perturbations.py
 pcaplab/pipeline.py
+pcaplab/rule_matcher.py
+pcaplab/stages.py
 pcaplab/stream.py
 pcaplab/utils.py
 pcaplab.egg-info/PKG-INFO

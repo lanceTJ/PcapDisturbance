@@ -15,3 +15,18 @@ dependencies = [
 
 [project.scripts]
 pcaplab = "pcaplab.cli:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pcaplab*"]
+exclude = [
+  "logs*",
+  "length_debug*",
+  "pcaplab_venv*",
+  "tests*",
+  "docs*",
+  "data*",
+]
