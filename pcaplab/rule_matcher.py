@@ -17,10 +17,9 @@ import yaml
 def _parse_iso_utc(s: str) -> float:
     """
     Parse ISO8601 string (with or without Z / timezone) as UTC epoch seconds.
-    Your CIC2018 rule file states times are UTC.
+    CIC2018 improved rules declare times are UTC.
     """
     s = str(s).strip()
-    # Accept "2018-03-02T19:54:52" or "...Z" or "...+00:00"
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
     dt = datetime.fromisoformat(s)
@@ -65,7 +64,6 @@ def _pkt_ctx(ts: float, buf: bytes) -> PacketCtx:
             p = ip.p
             l4 = ip.data
         elif isinstance(ip, dpkt.ip6.IP6):
-            # dpkt gives raw 16 bytes; use ipaddress for formatting
             import ipaddress
             src_ip = str(ipaddress.IPv6Address(ip.src))
             dst_ip = str(ipaddress.IPv6Address(ip.dst))
@@ -80,12 +78,9 @@ def _pkt_ctx(ts: float, buf: bytes) -> PacketCtx:
         elif p == dpkt.ip.IP_PROTO_UDP and isinstance(l4, dpkt.udp.UDP):
             proto_s = "udp"
             sport, dport = int(l4.sport), int(l4.dport)
-        elif p == dpkt.ip.IP_PROTO_ICMP:
-            proto_s = "icmp"
-        elif p == dpkt.ip.IP_PROTO_ICMP6:
+        elif p in (dpkt.ip.IP_PROTO_ICMP, dpkt.ip.IP_PROTO_ICMP6):
             proto_s = "icmp"
         else:
-            # Other protocol: keep proto None to avoid false positives on port constraints
             proto_s = None
 
     except Exception:
@@ -100,29 +95,12 @@ def _pkt_ctx(ts: float, buf: bytes) -> PacketCtx:
 
 def _normalize_field_name(field: str) -> str:
     f = str(field).strip().lower()
-    # YAML uses any_ip sometimes; normalize both any_ip/any_ip(s)
     if f in {"any_ip", "any_ips"}:
         return "any_ip"
     return f
 
 
-def _op_in(val, candidates: Sequence[Any]) -> bool:
-    return val in candidates
-
-
-def _op_not_in(val, candidates: Sequence[Any]) -> bool:
-    return val not in candidates
-
-
-def _op_eq(val, rhs) -> bool:
-    return val == rhs
-
-
-def _op_neq(val, rhs) -> bool:
-    return val != rhs
-
-
-def _op_range(ts: float, start_end: Sequence[Any]) -> bool:
+def _range_hit(ts: float, start_end) -> bool:
     a, b = start_end
     a_ts = _parse_iso_utc(a) if isinstance(a, str) else float(a)
     b_ts = _parse_iso_utc(b) if isinstance(b, str) else float(b)
@@ -131,8 +109,8 @@ def _op_range(ts: float, start_end: Sequence[Any]) -> bool:
     return a_ts <= ts <= b_ts
 
 
-def _op_ranges(ts: float, ranges: Sequence[Sequence[Any]]) -> bool:
-    return any(_op_range(ts, r) for r in ranges)
+def _ranges_hit(ts: float, ranges) -> bool:
+    return any(_range_hit(ts, r) for r in ranges)
 
 
 @dataclass(frozen=True)
@@ -146,28 +124,25 @@ def _compile_conditions(match_list: List[Dict[str, Any]]):
     """
     Compile a rule's 'match' list into a predicate on PacketCtx.
     Supported (packet-level) fields:
+      - time_window: op "range" / "ranges"
       - src_ip, dst_ip, any_ip
       - src_port, dst_port
       - proto
-      - time_window (op: range/ranges)
-    Unsupported (flow-level) fields are ignored.
+    Flow-level fields are ignored.
     """
     conds = []
 
     for cond in match_list or []:
-        field = _normalize_field_name(cond.get("field"))
-        op = str(cond.get("op")).strip().lower()
+        field = _normalize_field_name(cond.get("field", ""))
+        op = str(cond.get("op", "")).strip().lower()
         value = cond.get("value")
 
         # time window
         if field == "time_window":
             if op == "range":
-                conds.append(lambda ctx, v=value: _op_range(ctx.ts, v))
+                conds.append(lambda ctx, v=value: _range_hit(ctx.ts, v))
             elif op == "ranges":
-                conds.append(lambda ctx, v=value: _op_ranges(ctx.ts, v))
-            else:
-                # unsupported time op -> ignore
-                continue
+                conds.append(lambda ctx, v=value: _ranges_hit(ctx.ts, v))
             continue
 
         # IP fields
@@ -177,9 +152,9 @@ def _compile_conditions(match_list: List[Dict[str, Any]]):
 
             if field == "src_ip":
                 if op == "in":
-                    conds.append(lambda ctx, v=value: ctx.src_ip is not None and _op_in(ctx.src_ip, v))
+                    conds.append(lambda ctx, v=value: ctx.src_ip is not None and ctx.src_ip in v)
                 elif op == "not_in":
-                    conds.append(lambda ctx, v=value: ctx.src_ip is not None and _op_not_in(ctx.src_ip, v))
+                    conds.append(lambda ctx, v=value: ctx.src_ip is not None and ctx.src_ip not in v)
                 elif op == "==":
                     conds.append(lambda ctx, v=value: ctx.src_ip == v)
                 elif op == "!=":
@@ -188,16 +163,16 @@ def _compile_conditions(match_list: List[Dict[str, Any]]):
 
             if field == "dst_ip":
                 if op == "in":
-                    conds.append(lambda ctx, v=value: ctx.dst_ip is not None and _op_in(ctx.dst_ip, v))
+                    conds.append(lambda ctx, v=value: ctx.dst_ip is not None and ctx.dst_ip in v)
                 elif op == "not_in":
-                    conds.append(lambda ctx, v=value: ctx.dst_ip is not None and _op_not_in(ctx.dst_ip, v))
+                    conds.append(lambda ctx, v=value: ctx.dst_ip is not None and ctx.dst_ip not in v)
                 elif op == "==":
                     conds.append(lambda ctx, v=value: ctx.dst_ip == v)
                 elif op == "!=":
                     conds.append(lambda ctx, v=value: ctx.dst_ip != v)
                 continue
 
-            # any_ip: match if either end matches
+            # any_ip
             if field == "any_ip":
                 if op == "in":
                     conds.append(lambda ctx, v=value: (ctx.src_ip in v) or (ctx.dst_ip in v))
@@ -209,10 +184,11 @@ def _compile_conditions(match_list: List[Dict[str, Any]]):
                     conds.append(lambda ctx, v=value: (ctx.src_ip != v) and (ctx.dst_ip != v))
                 continue
 
-        # Ports (TCP/UDP only)
+        # Ports
         if field in {"src_port", "dst_port"}:
             if op in {"in", "not_in"} and not isinstance(value, (list, tuple)):
                 value = [value]
+
             if field == "src_port":
                 if op == "in":
                     conds.append(lambda ctx, v=value: ctx.src_port is not None and ctx.src_port in v)
@@ -223,6 +199,7 @@ def _compile_conditions(match_list: List[Dict[str, Any]]):
                 elif op == "!=":
                     conds.append(lambda ctx, v=value: ctx.src_port != int(v))
                 continue
+
             if field == "dst_port":
                 if op == "in":
                     conds.append(lambda ctx, v=value: ctx.dst_port is not None and ctx.dst_port in v)
@@ -236,9 +213,7 @@ def _compile_conditions(match_list: List[Dict[str, Any]]):
 
         # proto
         if field == "proto":
-            # accept numeric or text
             if isinstance(value, (int, float)):
-                # 6 tcp, 17 udp, 1 icmp (ipv4), 58 icmpv6
                 mapping = {6: "tcp", 17: "udp", 1: "icmp", 58: "icmp"}
                 want = mapping.get(int(value))
             else:
@@ -247,8 +222,7 @@ def _compile_conditions(match_list: List[Dict[str, Any]]):
                 conds.append(lambda ctx, w=want: ctx.proto == w)
             continue
 
-        # Unsupported flow-level fields -> ignore safely
-        # e.g. zero_fwd, total_fwd_len, bwd_rst_flags, flow_duration_s, ...
+        # ignore flow-level fields safely
         continue
 
     def _all(ctx: PacketCtx) -> bool:
@@ -260,23 +234,25 @@ def _compile_conditions(match_list: List[Dict[str, Any]]):
 @functools.lru_cache(maxsize=32)
 def _load_rules_yaml(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        return yaml.safe_load(f) or {}
 
 
 class YamlRulePacketMatcher:
     """
-    Packet-level matcher backed by the 'Improved CSE-CIC-IDS2018' YAML.
-    It treats a packet as "matched" if it matches ANY selected rule.
+    Packet-level matcher backed by CIC2018 improved YAML.
+    It returns match if ANY selected rule matches (priority order, first match wins).
     """
+
     def __init__(self, rules_path: str, include_labels: Optional[Sequence[str]] = None):
-        self.rules_path = rules_path
+        self.rules_path = str(rules_path)
         self.include_labels = set(include_labels) if include_labels else None
         self._compiled: List[CompiledRule] = []
-        self._compile()
+        self._compile()  # <-- this exists now
 
-    def _compile(self):
+    def _compile(self) -> None:
         doc = _load_rules_yaml(self.rules_path)
         rules = doc.get("rules", []) or []
+
         compiled: List[CompiledRule] = []
         for r in rules:
             label = str(r.get("label", ""))
@@ -286,13 +262,20 @@ class YamlRulePacketMatcher:
             match_list = r.get("match", []) or []
             fn = _compile_conditions(match_list)
             compiled.append(CompiledRule(label=label, priority=prio, fn=fn))
-        # Evaluate higher priority first (lower number)
-        compiled.sort(key=lambda x: x.priority)
+
+        compiled.sort(key=lambda x: x.priority)  # lower number = higher priority
         self._compiled = compiled
 
-    def match_packet(self, ts: float, buf: bytes) -> bool:
+    @property
+    def loaded_rule_labels(self) -> List[str]:
+        return [cr.label for cr in self._compiled]
+
+    def match_first_label(self, ts: float, buf: bytes) -> Optional[str]:
         ctx = _pkt_ctx(ts, buf)
         for cr in self._compiled:
             if cr.fn(ctx):
-                return True
-        return False
+                return cr.label
+        return None
+
+    def match_packet(self, ts: float, buf: bytes) -> bool:
+        return self.match_first_label(ts, buf) is not None

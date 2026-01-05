@@ -65,4 +65,4 @@ def main():
     )
 
     # brief summary
-    print(json.dumps(results[:10], indent=2, ensure_ascii=False))
+    # print(json.dumps(results[:10], indent=2, ensure_ascii=False))

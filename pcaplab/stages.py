@@ -5,7 +5,8 @@ import dataclasses
 import heapq
 import ipaddress
 import random
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from typing import Deque, Iterable, List, Optional, Tuple, Any
 from collections import deque
 
@@ -14,6 +15,7 @@ import dpkt
 from .core import Record, Stage
 from .match import AttackMatcher
 from .rule_matcher import YamlRulePacketMatcher
+from .utils import log
 
 
 def parse_l3_addrs(buf: bytes) -> Tuple[Optional[str], Optional[str], str]:
@@ -48,6 +50,16 @@ def fixed_len_bytes(buf: bytes, new_len: int, pad_byte: int) -> bytes:
         return buf[:new_len]
     return buf + bytes([pad_byte]) * (new_len - len(buf))
 
+def _match_label(matcher: Any, rec: Record) -> Optional[str]:
+    if matcher is None:
+        return None
+    fn = getattr(matcher, "match_first_label", None)
+    if callable(fn):
+        return fn(rec.ts, rec.buf)
+    fn2 = getattr(matcher, "match_packet", None)
+    if callable(fn2):
+        return "__matched__" if fn2(rec.ts, rec.buf) else None
+    raise TypeError(f"Unsupported matcher type: {type(matcher)}")
 
 def _match_packet(matcher: Any, rec: Record) -> bool:
     """
@@ -92,20 +104,86 @@ class RetransmitStage(Stage):
 
 @dataclass
 class LengthForgeStage(Stage):
-    pct: float  # 0..1
+    pct: float
     new_len: int
     pad_byte: int
     rng: random.Random
-    matcher: Optional[Any] = None  # <- accept YamlRulePacketMatcher
+    matcher: Optional[Any] = None
+
+    # debug knobs
+    debug: bool = False
+    debug_samples: int = 5
+
+    # counters
+    seen: int = 0
+    matched: int = 0
+    matched_but_skipped_by_pct: int = 0
+    applied: int = 0
+    padded: int = 0
+    truncated: int = 0
+    unchanged_already_len: int = 0
+
+    label_counter: Counter = field(default_factory=Counter)
+    sample_lines: List[str] = field(default_factory=list)
 
     def feed(self, rec: Record) -> Iterable[Record]:
-        if self.matcher is not None and not _match_packet(self.matcher, rec):
+        self.seen += 1
+
+        label = None
+        if self.matcher is not None:
+            label = _match_label(self.matcher, rec)
+            if label is None:
+                if self.debug and len(self.sample_lines) < self.debug_samples:
+                    self.sample_lines.append(f"[MISS] ts={rec.ts:.6f} len={len(rec.buf)}")
+                return [rec]
+
+        # matched (or matcher is None)
+        if self.matcher is not None:
+            self.matched += 1
+            self.label_counter[label] += 1
+
+        # pct gate
+        if self.rng.random() >= self.pct:
+            if self.matcher is not None:
+                self.matched_but_skipped_by_pct += 1
+            if self.debug and len(self.sample_lines) < self.debug_samples:
+                self.sample_lines.append(f"[SKIP_PCT] ts={rec.ts:.6f} len={len(rec.buf)} label={label}")
             return [rec]
-        if self.rng.random() < self.pct:
-            from .stages import fixed_len_bytes  # or keep your local helper
-            nb = fixed_len_bytes(rec.buf, self.new_len, self.pad_byte)
-            return [Record(ts=rec.ts, buf=nb, idx=rec.idx)]
-        return [rec]
+
+        # apply
+        old_len = len(rec.buf)
+        nb = fixed_len_bytes(rec.buf, self.new_len, self.pad_byte)
+        new_len = len(nb)
+
+        self.applied += 1
+        if old_len < self.new_len:
+            self.padded += 1
+        elif old_len > self.new_len:
+            self.truncated += 1
+        else:
+            self.unchanged_already_len += 1
+
+        if self.debug and len(self.sample_lines) < self.debug_samples:
+            self.sample_lines.append(
+                f"[APPLY] ts={rec.ts:.6f} {old_len}->{new_len} label={label}"
+            )
+
+        return [Record(ts=rec.ts, buf=nb, idx=rec.idx)]
+
+    def flush(self) -> Iterable[Record]:
+        if self.debug:
+            top_labels = self.label_counter.most_common(10)
+            log.info(
+                "[length_forge debug] "
+                f"seen={self.seen} matched={self.matched} "
+                f"skipped_by_pct={self.matched_but_skipped_by_pct} applied={self.applied} "
+                f"padded={self.padded} truncated={self.truncated} unchanged_len={self.unchanged_already_len}"
+            )
+            if top_labels:
+                log.info("[length_forge debug] top labels: " + ", ".join([f"{k}:{v}" for k, v in top_labels]))
+            for line in self.sample_lines:
+                log.info("[length_forge debug] " + line)
+        return []
 
 
 @dataclass

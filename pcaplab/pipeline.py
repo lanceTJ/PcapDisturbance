@@ -125,8 +125,22 @@ def compile_plan_to_stages(plan: List[dict], master_rng: random.Random) -> List[
         elif t in {"length_forge", "length-forge", "lenfake"}:
             new_len = int(params.get("new_len"))
             pad_byte = _parse_pad_byte(params.get("pad_byte", "00"))
-            matcher = _build_matcher(params)  # <- YAML matcher (optional)
-            stages.append(LengthForgeStage(pct=pct, new_len=new_len, pad_byte=pad_byte, rng=stage_rng, matcher=matcher))
+            matcher = _build_matcher(params)  # YAML matcher (optional)
+
+            debug = bool(params.get("debug", False))
+            debug_samples = int(params.get("debug_samples", 5))
+
+            stages.append(
+                LengthForgeStage(
+                    pct=pct,
+                    new_len=new_len,
+                    pad_byte=pad_byte,
+                    rng=stage_rng,
+                    matcher=matcher,
+                    debug=debug,
+                    debug_samples=debug_samples,
+                )
+            )
 
         elif t in {"reorder", "jitter"}:
             k = int(params.get("k", params.get("m", 5)))
