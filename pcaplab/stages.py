@@ -15,6 +15,7 @@ import dpkt
 from .core import Record, Stage
 from .match import AttackMatcher
 from .rule_matcher import YamlRulePacketMatcher
+from .perturbations import perturb_length_forge_l3aware
 from .utils import log
 
 
@@ -152,7 +153,7 @@ class LengthForgeStage(Stage):
 
         # apply
         old_len = len(rec.buf)
-        nb = fixed_len_bytes(rec.buf, self.new_len, self.pad_byte)
+        nb = perturb_length_forge_l3aware(rec.buf, new_len=self.new_len, pad_byte=self.pad_byte)
         new_len = len(nb)
 
         self.applied += 1
