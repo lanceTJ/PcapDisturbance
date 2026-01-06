@@ -16,6 +16,7 @@ from .stages import (
     DropStage,
     RetransmitStage,
     LengthForgeStage,
+    LengthForgeTM2Stage,
     ReorderStage,
     RateAdjustStage,
     OnlineTimeSorter,
@@ -123,24 +124,47 @@ def compile_plan_to_stages(plan: List[dict], master_rng: random.Random) -> List[
             stages.append(RetransmitStage(pct=pct, copies=copies, delay_ms=delay_ms, rng=stage_rng))
 
         elif t in {"length_forge", "length-forge", "lenfake"}:
-            new_len = int(params.get("new_len"))
+            strategy = str(params.get("strategy", "fixed")).lower().strip()
             pad_byte = _parse_pad_byte(params.get("pad_byte", "00"))
             matcher = _build_matcher(params)  # YAML matcher (optional)
 
             debug = bool(params.get("debug", False))
             debug_samples = int(params.get("debug_samples", 5))
 
-            stages.append(
-                LengthForgeStage(
-                    pct=pct,
-                    new_len=new_len,
-                    pad_byte=pad_byte,
-                    rng=stage_rng,
-                    matcher=matcher,
-                    debug=debug,
-                    debug_samples=debug_samples,
+            if strategy in {"tm2", "benign_pool", "pool"}:
+                pool_mode = str(params.get("pool_mode", "auto"))
+                benign_name_keywords = params.get("benign_name_keywords", ["benign", "normal"])
+                min_len = int(params.get("min_len", 60))
+                max_len = int(params.get("max_len", 1514))
+
+                stages.append(
+                    LengthForgeTM2Stage(
+                        forge_ratio=pct,
+                        pad_byte=pad_byte,
+                        rng=stage_rng,
+                        matcher=matcher,
+                        pool_mode=pool_mode,
+                        benign_name_keywords=list(benign_name_keywords),
+                        min_len=min_len,
+                        max_len=max_len,
+                        debug=debug,
+                        debug_samples=debug_samples,
+                    )
                 )
-            )
+            else:
+                # Backward-compatible fixed-length forge
+                new_len = int(params.get("new_len"))
+                stages.append(
+                    LengthForgeStage(
+                        pct=pct,
+                        new_len=new_len,
+                        pad_byte=pad_byte,
+                        rng=stage_rng,
+                        matcher=matcher,
+                        debug=debug,
+                        debug_samples=debug_samples,
+                    )
+                )
 
         elif t in {"reorder", "jitter"}:
             k = int(params.get("k", params.get("m", 5)))
@@ -177,6 +201,7 @@ def apply_perturbations_stream(
     chunk_size: int = 10000,
     show_progress: bool = False,
     progress_every: int = 200_000,
+    workflow_benign_sampler=None,
 ):
     """
     Stream records from in_pcap, apply stage pipeline, write to out_pcap.
@@ -195,6 +220,9 @@ def apply_perturbations_stream(
         raise ValueError("Current pipeline supports classic pcap only (pcapng not supported).")
 
     stages = compile_plan_to_stages(perturb_plan, master_rng)
+    for st in stages:
+        if st.__class__.__name__ == "LengthForgeTM2Stage":
+            st.prepare(in_pcap=in_pcap, workflow_sampler=workflow_benign_sampler)
 
     out_f = open(out_pcap, "wb")
     writer = dpkt.pcap.Writer(out_f, linktype=linktype)

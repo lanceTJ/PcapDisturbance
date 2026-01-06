@@ -6,6 +6,8 @@ from typing import List, Dict, Any, Tuple
 import time
 from .pipeline import apply_perturbations_stream
 from .utils import ensure_dir, is_encrypted_dir, log, now_iso
+from .length_pool import BenignLengthSampler
+from .stream import stream_pcap_packets_fast
 
 def collect_pcaps(in_root: Path) -> list[Path]:
     """Collect all files starting with 'cap' (no extension dependency)."""
@@ -21,6 +23,44 @@ def os_walk_skip_encrypted(in_root: Path):
     for root, dirs, files in os.walk(in_root):
         dirs[:] = [d for d in dirs if not is_encrypted_dir(Path(d))]
         yield root, dirs, files
+
+def _maybe_build_workflow_benign_sampler(pcaps: list[Path], plan: list[dict], selection_seed: int) -> BenignLengthSampler | None:
+    # Find the first TM2 length_forge step that does NOT use YAML matcher
+    cfg = None
+    for step in plan:
+        t = str(step.get("type", "")).lower()
+        if t not in {"length_forge", "length-forge", "lenfake"}:
+            continue
+        params = step.get("params", {}) or {}
+        strategy = str(params.get("strategy", "fixed")).lower().strip()
+        if strategy in {"tm2", "benign_pool", "pool"} and not params.get("match"):
+            cfg = params
+            break
+
+    if cfg is None:
+        return None
+
+    benign_keywords = [str(x).lower() for x in cfg.get("benign_name_keywords", ["benign", "normal"])]
+    min_len = int(cfg.get("min_len", 60))
+    max_len = int(cfg.get("max_len", 1514))
+    max_pkts_per_pcap = int(cfg.get("max_pkts_per_pcap", 0))
+
+    sampler = BenignLengthSampler(min_len=min_len, max_len=max_len, seed=int(selection_seed))
+
+    benign_pcaps = [p for p in pcaps if any(k in p.name.lower() for k in benign_keywords)]
+    if not benign_pcaps:
+        raise ValueError(f"TM2 workflow benign pool requested, but no benign pcaps matched keywords={benign_keywords}")
+
+    for p in benign_pcaps:
+        n = 0
+        for _ts, pkt in stream_pcap_packets_fast(str(p)):
+            sampler.ingest_len(len(pkt))
+            n += 1
+            if max_pkts_per_pcap > 0 and n >= max_pkts_per_pcap:
+                break
+
+    sampler.finalize()
+    return sampler
 
 def _out_paths(in_pcap: Path, in_root: Path, out_root: Path):
     """
@@ -42,7 +82,8 @@ def _out_paths(in_pcap: Path, in_root: Path, out_root: Path):
 
 def process_single_pcap(in_pcap: Path, in_root: Path, out_root: Path,
                         plan: List[Dict[str,Any]],
-                        chunk_size=10000, selection_seed=0, verbose=False, resume=False) -> Dict[str,Any]:
+                        chunk_size=10000, selection_seed=0, verbose=False,
+                        resume=False, workflow_benign_sampler=None) -> Dict[str,Any]:
     date_dir, out_dir, out_pcap, meta_path = _out_paths(in_pcap, in_root, out_root)
     ensure_dir(out_dir)
     if resume and out_pcap.exists():
@@ -56,7 +97,8 @@ def process_single_pcap(in_pcap: Path, in_root: Path, out_root: Path,
         perturb_plan=plan,
         selection_seed=selection_seed,
         chunk_size=chunk_size,
-        show_progress=False
+        show_progress=False,
+        workflow_benign_sampler=workflow_benign_sampler,
     )
     dur = time.time() - t0
     meta = {
@@ -102,6 +144,7 @@ def _run_common(pcaps, in_root, out_root, plan, chunk_size, selection_seed,
 def run_threads(in_root: Path, out_root: Path, plan: List[Dict[str,Any]],
                 chunk_size=10000, selection_seed=0, workers=4, limit=None, verbose=False, resume=False, per_file_log=False):
     pcaps = collect_pcaps(in_root)
+    workflow_sampler = _maybe_build_workflow_benign_sampler(pcaps, plan, selection_seed)
     if limit: pcaps = pcaps[:limit]
     if workers <= 1:
         from concurrent.futures import Executor
