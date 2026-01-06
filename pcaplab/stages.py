@@ -16,7 +16,7 @@ import dpkt
 from .core import Record, Stage
 from .match import AttackMatcher
 from .rule_matcher import YamlRulePacketMatcher
-from .length_pool import BenignLengthSampler
+from .length_pool import BenignLengthSampler, GaussianLengthSampler
 from .stream import stream_pcap_packets_fast
 from .perturbations import perturb_length_forge_l3aware
 from .utils import log
@@ -207,6 +207,7 @@ class LengthForgeTM2Stage(Stage):
     pad_byte: int
     rng: random.Random
     matcher: Optional[Any] = None
+    sampler_kind: str = "empirical"  # or "gauss"
 
     # pool controls
     pool_mode: str = "auto"  # auto|self|workflow
@@ -252,8 +253,8 @@ class LengthForgeTM2Stage(Stage):
 
         # Case A: matcher provided -> mixed pcap, build pool from non-matched packets
         if self.matcher is not None and mode == "self":
-            sampler_seed = int(self.rng.getrandbits(32))
-            sampler = BenignLengthSampler(min_len=self.min_len, max_len=self.max_len, seed=sampler_seed)
+            self._seed = int(self.rng.getrandbits(32))
+            sampler = self._new_sampler()
             attack_indices: List[int] = []
 
             for idx, (ts, pkt) in enumerate(stream_pcap_packets_fast(in_pcap)):
@@ -305,6 +306,13 @@ class LengthForgeTM2Stage(Stage):
             return
 
         raise ValueError(f"Unsupported TM2 pool_mode={self.pool_mode} with matcher={self.matcher is not None}")
+
+    def _new_sampler(self):
+        k = str(self.sampler_kind).lower().strip()
+        if k in {"gauss", "gaussian", "tm2_gauss"}:
+            sigma_floor = float(getattr(self, "sigma_floor", 1.0))  # 可选
+            return GaussianLengthSampler(min_len=self.min_len, max_len=self.max_len, seed=self._seed, sigma_floor=sigma_floor)
+        return BenignLengthSampler(min_len=self.min_len, max_len=self.max_len, seed=self._seed)
 
     def feed(self, rec: Record) -> Iterable[Record]:
         if not self._prepared:

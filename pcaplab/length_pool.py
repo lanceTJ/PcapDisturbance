@@ -8,6 +8,8 @@ import hashlib
 import random
 from dataclasses import dataclass
 from typing import List, Optional
+import math
+from hashlib import blake2b
 
 
 @dataclass
@@ -84,3 +86,83 @@ class BenignLengthSampler:
         h.update(str(int(index)).encode("utf-8"))
         u = int.from_bytes(h.digest(), "little") % self._total
         return self._map_u_to_len(u)
+
+
+class GaussianLengthSampler:
+    """
+    Deterministic Gaussian sampler fitted from benign packet lengths.
+    - ingest_len(): collect benign lengths (Welford)
+    - finalize(): compute mu/sigma
+    - sample_for_index(i): deterministic N(mu, sigma) draw, then clipped to [min_len, max_len]
+    """
+
+    def __init__(self, min_len: int = 60, max_len: int = 1514, seed: int = 0, sigma_floor: float = 1.0):
+        self.min_len = int(min_len)
+        self.max_len = int(max_len)
+        self.seed = int(seed)
+        self.sigma_floor = float(sigma_floor)
+
+        # Welford accumulators
+        self._n = 0
+        self._mean = 0.0
+        self._m2 = 0.0
+
+        # fitted params
+        self.mu = None
+        self.sigma = None
+
+    @property
+    def total(self) -> int:
+        return int(self._n)
+
+    def ingest_len(self, L: int) -> None:
+        x = float(L)
+        if x < self.min_len or x > self.max_len:
+            return
+        self._n += 1
+        delta = x - self._mean
+        self._mean += delta / self._n
+        delta2 = x - self._mean
+        self._m2 += delta * delta2
+
+    def finalize(self) -> None:
+        if self._n <= 1:
+            self.mu = float(self._mean) if self._n == 1 else float(self.min_len)
+            self.sigma = float(self.sigma_floor)
+            return
+
+        var = self._m2 / (self._n - 1)
+        sigma = math.sqrt(max(var, 0.0))
+        self.mu = float(self._mean)
+        self.sigma = float(max(sigma, self.sigma_floor))
+
+    def _u01_pair(self, idx: int) -> tuple[float, float]:
+        # Deterministic 2 uniforms from hash(seed, idx)
+        h = blake2b(digest_size=16)
+        h.update(str(self.seed).encode("utf-8"))
+        h.update(b":")
+        h.update(str(idx).encode("utf-8"))
+        d = h.digest()
+        a = int.from_bytes(d[:8], "little")
+        b = int.from_bytes(d[8:], "little")
+
+        # map to (0,1)
+        u1 = (a + 1) / (2**64 + 2)
+        u2 = (b + 1) / (2**64 + 2)
+        return u1, u2
+
+    def sample_for_index(self, idx: int) -> int:
+        if self.mu is None or self.sigma is None:
+            raise RuntimeError("GaussianLengthSampler not finalized")
+
+        u1, u2 = self._u01_pair(idx)
+
+        # Box-Muller -> standard normal
+        z = math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2)
+        x = self.mu + self.sigma * z
+
+        # clip to valid range
+        L = int(round(x))
+        if L < self.min_len: L = self.min_len
+        if L > self.max_len: L = self.max_len
+        return L

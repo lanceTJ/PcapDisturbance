@@ -131,7 +131,8 @@ def compile_plan_to_stages(plan: List[dict], master_rng: random.Random) -> List[
             debug = bool(params.get("debug", False))
             debug_samples = int(params.get("debug_samples", 5))
 
-            if strategy in {"tm2", "benign_pool", "pool"}:
+            if strategy in {"tm2", "benign_pool", "pool", "gauss", "gaussian", "tm2_gauss"}:
+                sampler_kind = "gauss" if strategy in {"gauss", "gaussian", "tm2_gauss"} else "empirical"
                 pool_mode = str(params.get("pool_mode", "auto"))
                 benign_name_keywords = params.get("benign_name_keywords", ["benign", "normal"])
                 min_len = int(params.get("min_len", 60))
@@ -149,6 +150,8 @@ def compile_plan_to_stages(plan: List[dict], master_rng: random.Random) -> List[
                         max_len=max_len,
                         debug=debug,
                         debug_samples=debug_samples,
+                        sampler_kind=sampler_kind,
+                        # sigma_floor=float(params.get("sigma_floor", 1.0)),
                     )
                 )
             else:

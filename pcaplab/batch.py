@@ -6,7 +6,7 @@ from typing import List, Dict, Any, Tuple
 import time
 from .pipeline import apply_perturbations_stream
 from .utils import ensure_dir, is_encrypted_dir, log, now_iso
-from .length_pool import BenignLengthSampler
+from .length_pool import BenignLengthSampler, GaussianLengthSampler
 from .stream import stream_pcap_packets_fast
 
 def collect_pcaps(in_root: Path) -> list[Path]:
@@ -33,7 +33,7 @@ def _maybe_build_workflow_benign_sampler(pcaps: list[Path], plan: list[dict], se
             continue
         params = step.get("params", {}) or {}
         strategy = str(params.get("strategy", "fixed")).lower().strip()
-        if strategy in {"tm2", "benign_pool", "pool"} and not params.get("match"):
+        if strategy in {"tm2", "benign_pool", "pool", "gauss", "gaussian", "tm2_gauss"} and not params.get("match"):
             cfg = params
             break
 
@@ -45,7 +45,11 @@ def _maybe_build_workflow_benign_sampler(pcaps: list[Path], plan: list[dict], se
     max_len = int(cfg.get("max_len", 1514))
     max_pkts_per_pcap = int(cfg.get("max_pkts_per_pcap", 0))
 
-    sampler = BenignLengthSampler(min_len=min_len, max_len=max_len, seed=int(selection_seed))
+    if strategy in {"gauss", "gaussian", "tm2_gauss"}:
+        sigma_floor = float(cfg.get("sigma_floor", 1.0))
+        sampler = GaussianLengthSampler(min_len=min_len, max_len=max_len, seed=int(selection_seed), sigma_floor=sigma_floor)
+    else:
+        sampler = BenignLengthSampler(min_len=min_len, max_len=max_len, seed=int(selection_seed))
 
     benign_pcaps = [p for p in pcaps if any(k in p.name.lower() for k in benign_keywords)]
     if not benign_pcaps:
